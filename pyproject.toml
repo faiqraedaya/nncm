@@ -1,0 +1,28 @@
+[project]
+name = "nncm"
+version = "0.1.0"
+description = "Neural Network Consequence Modelling – predicts release rate, velocity, distance to LFL, and flame length from pressure, temperature, and orifice diameter."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.3",
+    "tensorflow>=2.13",
+    "pyside6>=6.5",
+    "joblib>=1.3",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+shap = ["shap>=0.42"]
+
+[project.scripts]
+nncm = "nncm.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nncm"]
