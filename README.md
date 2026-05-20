@@ -86,6 +86,9 @@ Default sampling bounds (edit `src/nncm/data_generator.py` to change):
 
 ### `nncm train`
 
+Before training the model, use this generated data to produce consequence results using a consequence 
+modelling software and obtain the necessary outputs to be trained for.
+
 Reads `data/generated/training_data.csv` (columns: `Pressure`, `Temperature`, `Orifice_diameter`,
 `Release_rate`, `Velocity`, `Distance_to_LFL`, `Flame_length`), trains the model, and writes
 artifacts to `models/`:
