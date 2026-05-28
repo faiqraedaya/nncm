@@ -1,9 +1,6 @@
 """
 Neural network to predict multiple consequence metrics (Release rate, Velocity,
 Distance to LFL, Flame length) from Pressure, Temperature, Orifice_Diameter.
-
-Requirements:
-  pip install pandas numpy scikit-learn tensorflow matplotlib shap
 """
 
 import os
@@ -35,7 +32,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 CSV_PATH = PROJECT_ROOT / "data" / "generated" / "training_data.csv"
 RAW_INPUT_COLUMNS = ["Pressure", "Temperature", "Orifice_diameter"]
 TARGET_COLUMNS = ["Release_rate", "Velocity", "Distance_to_LFL", "Flame_length"]
-LOG_TARGET_COLUMNS = {"Release_rate"}
+LOG_TARGET_COLUMNS = {"Release_rate", "Distance_to_LFL"}
 USE_ENGINEERED_FEATURES = True
 SCALE_TARGETS = True
 
@@ -47,7 +44,9 @@ LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-6
 PATIENCE_ES = 30
 PATIENCE_RLR = 12
-MODEL_SAVE_PATH = PROJECT_ROOT / "models" / "best_model.h5"
+DROPOUT_RATE = 0.20
+MC_SAMPLES = 50
+MODEL_SAVE_PATH = PROJECT_ROOT / "models" / "best_model.keras"
 USE_LOG_TARGET = True
 
 # ---------------------------
@@ -107,50 +106,35 @@ def concatenate_outputs(predictions):
     return np.asarray(predictions)
 
 
+def dense_block(x, units, l2, name_prefix, dropout=True):
+    # LayerNorm (not BatchNorm) — normalizes per-sample, so train and eval modes
+    # behave identically. Avoids the EMA-running-stats divergence that makes
+    # val_loss NaN in early epochs.
+    from tensorflow.keras import layers
+    x = layers.Dense(units, kernel_regularizer=l2, name=f"{name_prefix}_d")(x)
+    x = layers.LayerNormalization(name=f"{name_prefix}_ln")(x)
+    x = layers.Activation("swish", name=f"{name_prefix}_act")(x)
+    if dropout:
+        x = layers.Dropout(DROPOUT_RATE, name=f"{name_prefix}_drop")(x)
+    return x
+
+
 def build_model(input_dim, target_names):
     from tensorflow.keras import layers, regularizers, Model, Input
     l2 = regularizers.l2(WEIGHT_DECAY)
     inp = Input(shape=(input_dim,), name="inputs")
-    x = layers.Dense(192, kernel_regularizer=l2)(inp)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("swish")(x)
-    x = layers.Dropout(0.05)(x)
 
-    r = layers.Dense(192, kernel_regularizer=l2)(x)
-    r = layers.BatchNormalization()(r)
-    r = layers.Activation("swish")(r)
-    r = layers.Dropout(0.05)(r)
-    x = layers.Add()([x, r])
+    # Shared trunk: plain MLP, 3 layers is shallow enough that residuals aren't needed
+    x = dense_block(inp, 96, l2, "trunk1")
+    x = dense_block(x,   96, l2, "trunk2")
+    x = dense_block(x,   64, l2, "trunk3")
 
-    x = layers.Dense(128, kernel_regularizer=l2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("swish")(x)
-    x = layers.Dropout(0.05)(x)
-
-    r = layers.Dense(128, kernel_regularizer=l2)(x)
-    r = layers.BatchNormalization()(r)
-    r = layers.Activation("swish")(r)
-    r = layers.Dropout(0.05)(r)
-    x = layers.Add()([x, r])
-
-    x = layers.Dense(64, kernel_regularizer=l2)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("swish")(x)
-    x = layers.Dropout(0.05)(x)
-
-    r = layers.Dense(64, kernel_regularizer=l2)(x)
-    r = layers.BatchNormalization()(r)
-    r = layers.Activation("swish")(r)
-    r = layers.Dropout(0.05)(r)
-    x = layers.Add()([x, r])
-
+    # Per-target heads — each target gets its own 2-layer specialization
     outputs = []
     for name in target_names:
-        head = layers.Dense(48, kernel_regularizer=l2)(x)
-        head = layers.BatchNormalization()(head)
-        head = layers.Activation("swish")(head)
-        head = layers.Dropout(0.05)(head)
-        out = layers.Dense(1, activation="linear", name=f"{name}_output")(head)
+        h = dense_block(x, 32, l2, f"{name}_h1", dropout=False)
+        h = dense_block(h, 16, l2, f"{name}_h2", dropout=False)
+        out = layers.Dense(1, activation="linear", name=f"{name}_output")(h)
         outputs.append(out)
 
     model = Model(inputs=inp, outputs=outputs, name="consequence_model")
@@ -163,6 +147,10 @@ def main():
     # ---------------------------
     # Load data
     # ---------------------------
+    # Ensure output directory exists BEFORE training so ModelCheckpoint can write to it
+    models_dir = PROJECT_ROOT / "models"
+    models_dir.mkdir(exist_ok=True)
+
     df = pd.read_csv(CSV_PATH)
     required_columns = RAW_INPUT_COLUMNS + TARGET_COLUMNS
     assert set(required_columns).issubset(df.columns), \
@@ -195,10 +183,9 @@ def main():
         X_temp, y_temp, test_size=valid_fraction_of_temp, random_state=SEED, shuffle=True
     )
 
-    target_variances = np.var(y_train, axis=0)
-    inv_var = 1.0 / np.maximum(target_variances, 1e-6)
-    inv_var_norm = inv_var / inv_var.mean()
-    loss_weights = {col: float(inv_var_norm[idx]) for idx, col in enumerate(TARGET_COLUMNS)}
+    # StandardScaler equalizes target variances to 1, so explicit per-target
+    # loss weighting is unnecessary and was previously miscomputed in the
+    # unscaled space — letting it default to equal weights is correct here.
 
     scaler_X = StandardScaler()
     X_train_scaled = scaler_X.fit_transform(X_train)
@@ -225,17 +212,11 @@ def main():
     # Model architecture
     # ---------------------------
     model = build_model(X_train_scaled.shape[1], TARGET_COLUMNS)
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=LEARNING_RATE,
-        first_decay_steps=50,
-        t_mul=2.0,
-        m_mul=0.8
-    )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+    # clipnorm guards against rare exploding-gradient steps in early training
+    optimizer = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, clipnorm=1.0)
     losses = {f"{col}_output": "mse" for col in TARGET_COLUMNS}
     metrics = {f"{col}_output": ["mae"] for col in TARGET_COLUMNS}
-    loss_weights_named = {f"{col}_output": loss_weights[col] for col in TARGET_COLUMNS}
-    model.compile(optimizer=optimizer, loss=losses, loss_weights=loss_weights_named, metrics=metrics)
+    model.compile(optimizer=optimizer, loss=losses, metrics=metrics)
     model.summary()
     prediction_model = Model(
         inputs=model.input,
@@ -245,10 +226,23 @@ def main():
     # ---------------------------
     # Callbacks
     # ---------------------------
-    es = callbacks.EarlyStopping(monitor="val_loss", patience=PATIENCE_ES, restore_best_weights=True, verbose=1)
+    # start_from_epoch=3 prevents EarlyStopping from latching onto a NaN epoch-1
+    # val_loss as the "best" weights to restore.
+    es = callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=PATIENCE_ES,
+        restore_best_weights=True,
+        start_from_epoch=3,
+        verbose=1,
+    )
     rlr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=PATIENCE_RLR, verbose=1, min_lr=1e-7)
-    mc = callbacks.ModelCheckpoint(str(MODEL_SAVE_PATH), monitor="val_loss", save_best_only=True, verbose=1)
-    lr_scheduler = callbacks.LearningRateScheduler(lambda epoch, lr: float(lr_schedule(epoch)), verbose=0)
+    mc = callbacks.ModelCheckpoint(
+        str(MODEL_SAVE_PATH),
+        monitor="val_loss",
+        save_best_only=True,
+        initial_value_threshold=1e6,
+        verbose=1,
+    )
 
     # ---------------------------
     # Training
@@ -258,17 +252,22 @@ def main():
         validation_data=(X_val_scaled, y_val_list),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
-        callbacks=[es, rlr, mc, lr_scheduler],
+        callbacks=[es, rlr, mc],
         verbose=2,
         shuffle=True
     )
 
     # ---------------------------
+    # Save final model (inference-ready with concatenated output)
+    # EarlyStopping(restore_best_weights=True) has already restored the best
+    # in-memory weights, so we save the prediction model directly.
+    # ---------------------------
+    prediction_model.save(str(MODEL_SAVE_PATH))
+    print(f"\nSaved trained model to {MODEL_SAVE_PATH}")
+
+    # ---------------------------
     # Evaluation (test set)
     # ---------------------------
-    if MODEL_SAVE_PATH.exists():
-        model.load_weights(str(MODEL_SAVE_PATH))
-
     y_test_pred_scaled = prediction_model.predict(X_test_scaled)
     if SCALE_TARGETS and scaler_y is not None:
         y_test_pred_processed = scaler_y.inverse_transform(y_test_pred_scaled)
@@ -278,7 +277,10 @@ def main():
         y_test_processed = y_test
 
     y_test_true = inverse_transform_targets(y_test_processed, log_target_columns, target_shifts)
-    y_test_pred_inv = inverse_transform_targets(y_test_pred_processed, log_target_columns, target_shifts)
+    y_test_pred_inv = np.clip(
+        inverse_transform_targets(y_test_pred_processed, log_target_columns, target_shifts),
+        0, None
+    )
 
     overall_mse = mean_squared_error(y_test_true, y_test_pred_inv)
     overall_rmse = sqrt(overall_mse)
@@ -308,6 +310,33 @@ def main():
         print(f"Residual std for {col}: {residual_stds[idx]:.6f}")
 
     # ---------------------------
+    # MC Dropout uncertainty (training=True keeps dropout active)
+    # ---------------------------
+    print(f"\n----- MC Dropout uncertainty ({MC_SAMPLES} samples) -----")
+    mc_preds_scaled = np.stack([
+        prediction_model(X_test_scaled, training=True).numpy()
+        for _ in range(MC_SAMPLES)
+    ], axis=0)  # (MC_SAMPLES, n_test, n_targets)
+    mc_mean_scaled = mc_preds_scaled.mean(axis=0)
+    mc_std_scaled = mc_preds_scaled.std(axis=0)
+
+    if SCALE_TARGETS and scaler_y is not None:
+        mc_mean_proc = scaler_y.inverse_transform(mc_mean_scaled)
+        # Propagate std through the linear scaler (multiply by scale, not shift)
+        mc_std_proc = mc_std_scaled * scaler_y.scale_
+    else:
+        mc_mean_proc = mc_mean_scaled
+        mc_std_proc = mc_std_scaled
+
+    mc_mean_orig = np.clip(
+        inverse_transform_targets(mc_mean_proc, log_target_columns, target_shifts),
+        0, None
+    )
+    for idx, col in enumerate(TARGET_COLUMNS):
+        mean_unc = mc_std_proc[:, idx].mean()
+        print(f"  {col}: mean epistemic std = {mean_unc:.6f}")
+
+    # ---------------------------
     # Quick plots (optional)
     # ---------------------------
     try:
@@ -334,22 +363,39 @@ def main():
     # ---------------------------
     # SHAP explainability (optional; can be heavy)
     # ---------------------------
-    SHAP_ENABLED = True
+    SHAP_ENABLED = False
     if SHAP_ENABLED:
         try:
             import shap
-            background = X_train_scaled[np.random.choice(X_train_scaled.shape[0], min(200, X_train_scaled.shape[0]), replace=False)]
+            n_bg = min(200, X_train_scaled.shape[0])
+            background = X_train_scaled[np.random.choice(X_train_scaled.shape[0], n_bg, replace=False)]
             shap_target_idx = 0
+            n_explain = min(200, X_test_scaled.shape[0])
+            X_explain = X_test_scaled[:n_explain]
             try:
                 explainer = shap.DeepExplainer(prediction_model, background)
-                shap_values = explainer.shap_values(X_test_scaled[:200])
+                shap_values = explainer.shap_values(X_explain)
             except Exception:
                 explainer = shap.KernelExplainer(lambda x: prediction_model.predict(x)[:, shap_target_idx], background)
                 shap_values = explainer.shap_values(X_test_scaled[:50], nsamples=100)
-            shap_values_to_plot = shap_values[shap_target_idx] if isinstance(shap_values, list) else shap_values
+                X_explain = X_test_scaled[:50]
+
+            # Normalize SHAP output shape to (n_samples, n_features) for the chosen target.
+            # SHAP DeepExplainer with multi-output Keras can return either:
+            #   - list of (n_samples, n_features) arrays, one per output (older SHAP), or
+            #   - a single (n_samples, n_features, n_outputs) array (newer SHAP)
+            if isinstance(shap_values, list):
+                shap_values_to_plot = shap_values[shap_target_idx]
+            else:
+                sv = np.asarray(shap_values)
+                if sv.ndim == 3:
+                    shap_values_to_plot = sv[:, :, shap_target_idx]
+                else:
+                    shap_values_to_plot = sv
+
             shap.summary_plot(
                 shap_values_to_plot,
-                X_test_scaled[:min(200, X_test_scaled.shape[0])],
+                X_explain,
                 feature_names=feature_columns,
                 show=False,
                 title=f"SHAP summary for {TARGET_COLUMNS[shap_target_idx]}"
@@ -361,8 +407,6 @@ def main():
     # Save scalers and artifacts
     # ---------------------------
     import joblib
-    models_dir = PROJECT_ROOT / "models"
-    models_dir.mkdir(exist_ok=True)
 
     joblib.dump(scaler_X, models_dir / "scaler_X.joblib")
     if SCALE_TARGETS and scaler_y is not None:
@@ -381,7 +425,7 @@ def main():
         models_dir / "target_meta.joblib"
     )
 
-    print("Model, scaler and metadata saved.")
+    print(f"Scalers and metadata saved to {models_dir}")
 
 
 if __name__ == "__main__":

@@ -129,26 +129,6 @@ constants at the top of each source file:
 | `MODEL_SAVE_PATH` | `neural_network.py` | Path to save the trained model |
 | `USE_ENGINEERED_FEATURES` | `neural_network.py` | Enable log/interaction feature engineering |
 
-## Project structure
-
-```
-2507P_NNCM/
-├── main.py                   # Root entry point (delegates to nncm.__main__)
-├── pyproject.toml            # Project metadata and dependencies
-├── src/nncm/
-│   ├── __init__.py
-│   ├── __main__.py           # CLI (generate / train / gui subcommands)
-│   ├── data_generator.py     # LHS sampling and Excel export
-│   ├── neural_network.py     # Model training, evaluation, and artifact saving
-│   └── gui_predictor.py      # PySide6 prediction GUI (nncm)
-├── models/                   # Trained artifacts — gitignored
-├── data/
-│   ├── raw/                  # Reference NNCM output files — tracked
-│   ├── generated/            # LHS outputs and training CSV — gitignored
-│   └── plots/                # Distribution plots — gitignored
-└── LICENSE
-```
-
 ## License
 
 This project is provided under the MIT License.
