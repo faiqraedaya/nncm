@@ -1,22 +1,26 @@
 [project]
 name = "nncm"
-version = "0.1.0"
-description = "Neural Network Consequence Modelling – predicts release rate, velocity, distance to LFL, and flame length from pressure, temperature, and orifice diameter."
+version = "0.2.0"
+description = "Neural Network Consequence Modelling – samples release scenarios, drives them through Phast/Safeti, and trains a surrogate model that predicts consequence results."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",
+    "scipy>=1.10",
     "matplotlib>=3.7",
     "scikit-learn>=1.3",
     "tensorflow>=2.13",
     "pyside6>=6.5",
     "joblib>=1.3",
     "openpyxl>=3.1",
-    "shap>=0.49.1",
 ]
 
 [project.optional-dependencies]
 shap = ["shap>=0.42"]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 nncm = "nncm.__main__:main"

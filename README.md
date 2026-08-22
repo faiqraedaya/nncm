@@ -1,49 +1,19 @@
 # nncm
 
-Neural Network Consequence Modelling — predicts release rate, velocity, distance to LFL, and flame
-length from process pressure, temperature, and orifice diameter.
-
-## Features
-
-### `nncm generate`
-
-Latin Hypercube Sampling over configurable ranges (defaults below). Writes
-`data/generated/pressure_vessel_input.xlsx` and `leak_input.xlsx` for use with external
-consequence-modelling software.
-
-| Parameter | Min | Max | Unit |
-|---|---|---|---|
-| Temperature | −40 | 200 | °C |
-| Pressure | 1 | 100 | barg |
-| Orifice diameter | 1 | 1 000 | mm |
-
-### `nncm train`
-
-Reads `data/generated/training_data.csv` (columns: `Pressure`, `Temperature`, `Orifice_diameter`,
-`Release_rate`, `Velocity`, `Distance_to_LFL`, `Flame_length`) and writes:
+**Neural Network Consequence Modelling** — a surrogate model for consequence analysis.
+Sample release scenarios, run them through Phast/Safeti once, train a neural network on the
+results, then predict consequences in milliseconds instead of hours of solver time.
 
 ```
-models/
-├── best_model.keras    # Trained model (Keras 3 native format)
-├── scaler_X.joblib     # Input feature scaler
-├── scaler_y.joblib     # Target scaler
-└── target_meta.joblib  # Feature engineering + log-transform metadata
+sample  ──▶  export  ──▶  [ Phast ]  ──▶  import  ──▶  train  ──▶  predict
+ design      workbook      you run it      dataset     model      app / CLI / CSV
 ```
 
-The trained network is a plain MLP (96 → 96 → 64) with LayerNorm, swish activations, and four
-per-target heads. `Release_rate` and `Distance_to_LFL` are log1p-transformed before training to
-handle wide dynamic ranges; targets are StandardScaled. MC Dropout uncertainty estimates are
-reported per target after evaluation.
+Only the two Phast steps — importing the workbook and exporting the results — are manual.
+Everything else lives in one application and one CLI, around a *project directory* that holds the
+config, the sampled cases, the workbooks, the dataset and every trained model.
 
-Key hyperparameters live at the top of `src/nncm/neural_network.py` (`EPOCHS`, `BATCH_SIZE`,
-`LEARNING_RATE`, `DROPOUT_RATE`, `LOG_TARGET_COLUMNS`, etc.).
-
-### `nncm gui`
-
-PySide6 window that loads `models/best_model.keras` plus the scalers and metadata, then predicts
-all four outputs from user-entered pressure, temperature, and orifice diameter.
-
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/faiqraedaya/nncm
@@ -51,19 +21,88 @@ cd nncm
 uv sync
 ```
 
-To include SHAP explainability:
+## Use it
 
 ```bash
-uv sync --extra shap
+uv run nncm gui
 ```
 
-## Usage
+The window works through the five stages in order — **Project · Sample · Phast · Train ·
+Predict**. Each stage says what it needs and what it produced, and nothing runs before the stage
+it depends on has finished.
+
+The same workflow from the command line:
 
 ```bash
-uv run nncm generate    # Generate LHS sampling data → data/generated/
-uv run nncm train       # Train model → models/best_model.keras
-uv run nncm gui         # Launch prediction GUI
+uv run nncm init                        # create ./workspace with a default config
+uv run nncm sample --vessels 500        # sampling design      -> cases/cases.csv
+uv run nncm export                      # Phast input workbook -> phast/input/*.xlsx
+
+#   ... import that workbook into Phast, run the study, export the results workbook ...
+
+uv run nncm import path/to/results.xlsx # training data        -> datasets/training_data.csv
+uv run nncm train                       # trained model        -> models/run_<stamp>/
+uv run nncm predict --temperature 25 --pressure 60 --orifice 25 --material METHANE --mc 50
 ```
+
+Every command takes `--project/-p <dir>`; the default is `./workspace`.
+
+## What each stage does
+
+| Stage | What it does |
+| --- | --- |
+| **sample** | Builds the design of experiments — Latin Hypercube over temperature, pressure and hole size, inside each material's own envelope. |
+| **export** | Writes the cases into a copy of the Safeti template, as a workbook Phast will import. |
+| **import** | Reads the Phast results workbook, joins it back onto the cases, and reports the scenarios that failed to converge instead of scoring them as zero. |
+| **train** | Fits one network across all materials and consequences, split by vessel so the score measures generalisation to new equipment. |
+| **predict** | Answers a single point or a CSV, with optional uncertainty, and flags inputs outside the training envelope. |
+
+Four consequences are trained by default — release rate, velocity, distance to LFL and flame
+length. Around twenty are extracted from the results workbook, so others can be trained by naming
+them in the config.
+
+## Project layout
+
+```
+workspace/
+├── nncm.json                  # single source of configuration
+├── cases/cases.csv            # the sampling design (one row per leak scenario)
+├── phast/input/*.xlsx         # workbooks to import into Phast
+├── phast/output/*.xlsx        # where to drop Phast result workbooks
+├── datasets/training_data.csv # extracted, joined training data
+├── models/run_<stamp>/        # model.keras, scalers, meta.json, metrics, history
+├── models/registry.json       # which run is current
+└── plots/                     # design and diagnostic plots
+```
+
+## Configuration
+
+Everything lives in `nncm.json`, editable in the app's **Project** stage: sampling ranges,
+materials, the Phast template path and its per-column defaults, extraction filters and training
+hyperparameters.
+
+A material is either a pure component or a mixture — double-click a row of the Materials table to
+edit one. Component names must match the Phast property system exactly: `NITROGEN
+(ASPHYXIATING)`, not `NITROGEN`.
+
+A new project starts with thirteen: seven pure fluids (methane, ethane, propane, n-butane,
+ammonia, CO2 and hydrogen) and six process streams (natural gas, LNG, LPG, sour feed gas, NGL and
+stabilised condensate), each carrying the temperature and pressure envelope it is stored at.
+Compositions are representative — replace them with the stream data for the plant you are
+modelling.
+
+## Tests
+
+```bash
+uv run --with pytest python -m pytest tests -q
+```
+
+## How it works
+
+[TECHNICAL.md](TECHNICAL.md) covers the parts worth knowing when a result looks wrong, or when
+you need to trust a number: why the design is sampled the way it is, the mixture format, why the
+workbook is patched rather than re-saved, how results are matched back to cases, and what the
+model is actually fitting.
 
 ## License
 
