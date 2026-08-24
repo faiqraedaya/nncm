@@ -456,7 +456,8 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
         if not usable.any():
             # An empty panel says what is absent rather than showing a blank box.
             ax.text(0.5, 0.5, "No positive pair to plot.", ha="center", va="center",
-                    fontsize=theme.FONT_CAPTION, color=theme.SUBTLE, transform=ax.transAxes)
+                    fontsize=theme.pt(theme.FONT_CAPTION),
+                    color=theme.ink_hex(theme.INK_SECONDARY), transform=ax.transAxes)
             ax.set_xticks([])
             ax.set_yticks([])
             theme.style_axes(ax, grid="none")
@@ -464,7 +465,10 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
 
         low = float(min(true[usable].min(), pred[usable].min()))
         high = float(max(true[usable].max(), pred[usable].max()))
-        ax.plot([low, high], [low, high], color=theme.TERTIARY, linewidth=1.0, zorder=1)
+        # The 1:1 line is the reference the marks are read against, so it is
+        # ordered chrome in ink, not a second data series in a hue.
+        ax.plot([low, high], [low, high], color=theme.ink_hex(theme.INK_GLYPH),
+                linewidth=1.0, zorder=1)
         ax.scatter(true[usable], pred[usable], s=12, alpha=0.45,
                    color=theme.SERIES[0], linewidths=0, zorder=2)
         ax.set_xscale("log")
@@ -476,7 +480,8 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
         r2 = _r2(true[usable], pred[usable])
         ax.text(0.03, 0.97, f"R2 {r2:.3f}" if np.isfinite(r2) else "R2 unavailable",
                 transform=ax.transAxes, ha="left", va="top",
-                fontsize=theme.FONT_CAPTION, color=theme.SUBTLE)
+                fontsize=theme.pt(theme.FONT_CAPTION),
+                color=theme.ink_hex(theme.INK_SECONDARY))
 
     for index in range(len(targets), rows * cols):
         axes[index // cols][index % cols].axis("off")

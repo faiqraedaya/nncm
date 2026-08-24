@@ -26,13 +26,14 @@ pytest.importorskip("PySide6", reason="PySide6 is not installed")
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from nncm.gui import style, widgets  # noqa: E402
+from nncm.gui import theme as gui_theme  # noqa: E402
+from nncm.gui import widgets  # noqa: E402
 
 
 @pytest.fixture(scope="session")
 def app():
     application = QApplication.instance() or QApplication([])
-    style.apply(application)
+    gui_theme.apply_theme(application)
     return application
 
 
@@ -48,7 +49,41 @@ def test_series_palette_is_finite_and_refuses_to_cycle():
 def test_stylesheet_substitutes_every_token(app):
     sheet = app.styleSheet()
     assert "$" not in sheet, "a token was left unsubstituted in the style sheet"
-    assert theme.ACCENT in sheet and theme.SURFACE in sheet
+    assert theme.ACTION in sheet and theme.CANVAS in sheet
+
+
+def test_every_neutral_is_ink_over_the_canvas(app):
+    """No hex greys, no tinted neutrals: a neutral cannot acquire a hue."""
+    import re
+
+    sheet = app.styleSheet()
+    allowed = {
+        value.upper()
+        for value in (
+            theme.CANVAS, theme.INK, theme.ACTION, theme.ACTION_HOVER,
+            theme.ACTION_PRESSED, theme.ACTION_TEXT, theme.SUCCESS,
+            theme.SUCCESS_BG, theme.WARNING, theme.WARNING_BG, theme.ERROR,
+            theme.ERROR_BG, theme.ERROR_PRESSED, theme.ink_hex(0.92),
+        )
+    }
+    for literal in re.findall(r"#[0-9a-fA-F]{6}", sheet):
+        assert literal.upper() in allowed, (
+            f"{literal} is a colour literal the token set does not name"
+        )
+
+
+def test_the_ink_ladder_still_clears_its_contrast_floors():
+    for rung in theme.check_ladder():
+        assert round(rung["ratio"], 1) >= rung["floor"], (
+            f"{rung['name']} fell to {rung['ratio']:.1f}:1"
+        )
+
+
+def test_matplotlib_type_is_converted_from_px_to_points():
+    """A px token passed straight to an rcParam renders ~39 % oversized."""
+    rc = theme.matplotlib_rc()
+    assert rc["font.size"] == pytest.approx(theme.FONT_CAPTION * 72.0 / 100.0)
+    assert rc["font.size"] < theme.FONT_CAPTION
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +214,9 @@ def test_a_form_row_carries_its_label_unit_and_sentence(app):
     texts = [label.text() for label in form.findChildren(QLabel)]
     assert "Orifice diameter" in texts
     assert "mm" in texts
-    assert any(label.objectName() == "Explanation" for label in form.findChildren(QLabel))
+    assert any(
+        label.property("role") == "explanation" for label in form.findChildren(QLabel)
+    )
 
 
 def test_numeric_fields_are_right_aligned_and_keep_their_own_wheel(app):
@@ -201,10 +238,12 @@ def test_window_builds_and_every_stage_paints(app, tmp_path):
 
     window = MainWindow(tmp_path / "project")
     window.show()
-    assert window.tabs.count() == 5
-    for index in range(window.tabs.count()):
-        window.tabs.setCurrentIndex(index)
+    assert window.stack.count() == 5
+    for index in range(window.stack.count()):
+        window.show_page(index)
         app.processEvents()
+        # The shell names the current page, once, from the navigation.
+        assert window.page_title.text()
 
     window.set_descriptions_visible(False)
     window.set_detail_visible(True)
@@ -217,7 +256,7 @@ def test_window_builds_and_every_stage_paints(app, tmp_path):
 
 
 def test_each_stage_offers_exactly_one_primary_action(app, tmp_path):
-    """One Primary per surface — the rule most easily broken by accident."""
+    """One primary per surface — the rule most easily broken by accident."""
     from PySide6.QtWidgets import QPushButton
 
     from nncm.gui.app import MainWindow
@@ -227,9 +266,107 @@ def test_each_stage_offers_exactly_one_primary_action(app, tmp_path):
         primaries = [
             button
             for button in page.actions.findChildren(QPushButton)
-            if button.property("primary") == "true"
+            if button.property("variant") == "primary"
         ]
         assert len(primaries) == 1, f"{type(page).__name__} has {len(primaries)} primaries"
+    window.close()
+
+
+def test_the_primary_sits_on_the_trailing_edge_of_every_action_bar(app, tmp_path):
+    """A primary that moves between pages is the most visible inconsistency."""
+    from PySide6.QtWidgets import QPushButton
+
+    from nncm.gui.app import MainWindow
+
+    window = MainWindow(tmp_path / "project")
+    for page in window._pages():
+        buttons = page.actions.findChildren(QPushButton)
+        order = sorted(buttons, key=lambda b: page.actions._layout.indexOf(b))
+        assert order[-1].property("variant") == "primary", (
+            f"{type(page).__name__} does not end its action bar with the primary"
+        )
+    window.close()
+
+
+def test_the_phast_primary_stays_trailing_as_it_moves_between_steps(app, tmp_path):
+    """Which step is next changes; where the primary sits does not."""
+    from PySide6.QtWidgets import QPushButton
+
+    from nncm.gui.app import MainWindow
+
+    window = MainWindow(tmp_path / "project")
+    page = window.phast_page
+    for ready in (False, True):
+        # Drive both branches of the state machine directly.
+        widgets.set_primary(page.import_button, ready)
+        widgets.set_primary(page.export_button, not ready)
+        page.actions.order(
+            [page.export_button, page.import_button] if ready
+            else [page.import_button, page.export_button]
+        )
+        buttons = page.actions.findChildren(QPushButton)
+        order = sorted(buttons, key=lambda b: page.actions._layout.indexOf(b))
+        assert order[-1].property("variant") == "primary"
+    window.close()
+
+
+def test_the_window_refuses_to_be_squeezed_below_its_content(app, tmp_path):
+    from nncm.gui.app import MainWindow
+
+    window = MainWindow(tmp_path / "project")
+    assert window.minimumWidth() >= MainWindow.MIN_W
+    assert window.minimumHeight() >= MainWindow.MIN_H
+    window.close()
+
+
+def test_the_navigation_rail_can_be_hidden_and_brought_back(app, tmp_path):
+    from nncm.gui.app import MainWindow
+
+    window = MainWindow(tmp_path / "project")
+    window.show()
+    assert window.sidebar.isVisible()
+    width_before = window.splitter.sizes()[0]
+    window.toggle_sidebar()
+    app.processEvents()
+    assert not window.sidebar.isVisible()
+    # The way back must stay on screen, or the rail is simply lost.
+    assert window.rail_toggle.isVisible()
+    window.toggle_sidebar()
+    app.processEvents()
+    assert window.sidebar.isVisible()
+    assert window.splitter.sizes()[0] == width_before
+    window.close()
+
+
+def test_every_icon_in_the_set_renders(app):
+    """A missing glyph must fail loudly, and a present one must draw."""
+    from nncm.gui.icons import icon, names
+
+    for name in names():
+        rendered = icon(name)
+        assert not rendered.isNull(), f"{name} rendered empty"
+        assert not rendered.pixmap(16, 16).isNull()
+    with pytest.raises(KeyError):
+        icon("no-such-glyph")
+
+
+def test_a_failure_reports_inline_and_releases_the_busy_state(app, tmp_path):
+    """A calculation that failed must not leave the window looking hung."""
+    from nncm.gui.app import MainWindow
+
+    window = MainWindow(tmp_path / "project")
+    page = window.sample_page
+    window.begin_task("Generating cases")
+    page.generate_button.setEnabled(False)
+    page.actions.show_running()
+    assert window._busy.isVisibleTo(window)
+
+    page._failed("ValueError: the design has no materials")
+
+    assert page.status.isVisibleTo(page), "the failure was not reported inline"
+    assert page.status.property("role") == "error"
+    assert not window._busy.isVisibleTo(window), "the busy indicator was left running"
+    assert page.generate_button.isEnabled(), "the trigger was not handed back"
     window.close()
 
 
@@ -270,7 +407,7 @@ def test_bundled_faces_register_and_are_the_ones_used(app):
     """Bundled type is only worth bundling if the window actually gets it."""
     from PySide6.QtGui import QFontDatabase, QFontInfo
 
-    from nncm.gui.style import FONTS_DIR
+    from nncm.gui.theme import FONTS_DIR
 
     if not any(FONTS_DIR.glob("*.ttf")) and not any(FONTS_DIR.glob("*.otf")):
         pytest.skip("no faces bundled; the stack falls back to the system face")
@@ -279,11 +416,11 @@ def test_bundled_faces_register_and_are_the_ones_used(app):
     assert first in QFontDatabase.families(), f"{first} was not registered"
     for size, weight, italic in (
         (theme.FONT_BODY, theme.WEIGHT_REGULAR, False),
-        (theme.FONT_CONTROL, theme.WEIGHT_MEDIUM, False),
+        (theme.FONT_LABEL, theme.WEIGHT_MEDIUM, False),
         (theme.FONT_TITLE, theme.WEIGHT_SEMIBOLD, False),
         (theme.FONT_CAPTION, theme.WEIGHT_REGULAR, True),  # the real italic
     ):
-        info = QFontInfo(style.font(size, weight, italic=italic))
+        info = QFontInfo(gui_theme.font(size, weight, italic=italic))
         assert info.family() == first, f"{size}px/{weight} fell back to {info.family()}"
         assert info.italic() == italic
 
@@ -298,7 +435,7 @@ def test_charts_are_set_in_the_same_face_as_the_window():
     import matplotlib
     from matplotlib import font_manager
 
-    from nncm.gui.style import FONTS_DIR
+    from nncm.gui.theme import FONTS_DIR
 
     theme.apply_matplotlib_style()
     if not any(FONTS_DIR.glob("*.ttf")) and not any(FONTS_DIR.glob("*.otf")):
@@ -421,3 +558,71 @@ def test_a_sentence_is_measured_at_the_width_it_is_given(app):
     narrow = note.heightForWidth(180)
     note.setMinimumHeight(narrow)          # what a first, cramped layout does
     assert note.heightForWidth(900) < narrow, "the measured height only ever grew"
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+def test_the_splash_module_pulls_in_nothing_expensive():
+    """The whole point of the splash is being on screen before the slow work.
+
+    ``nncm.gui.splash`` may import PySide6 and the Qt-free tokens, and nothing
+    else. If pandas or matplotlib ever arrive through it, the splash can only
+    appear once the wait it exists to cover is already over.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys;"
+        "import nncm.gui.splash;"
+        "heavy=[m for m in ('pandas','matplotlib','openpyxl','sklearn','tensorflow')"
+        " if m in sys.modules];"
+        "print(','.join(heavy))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, check=True,
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+    )
+    assert result.stdout.strip() == "", (
+        f"the splash dragged in {result.stdout.strip()}"
+    )
+
+
+def test_the_splash_reports_every_stage_and_finishes_full(app):
+    from nncm.gui.splash import Splash
+
+    splash = Splash(steps=3)
+    splash.show()
+    seen = []
+    for message in ("First…", "Second…", "Third…"):
+        splash.step(message)
+        seen.append(splash._caption.text())
+    assert seen == ["First…", "Second…", "Third…"]
+
+    window = QApplication.activeWindow() or splash
+    splash.finish(window)
+    assert splash._bar.value() == splash._bar.maximum(), (
+        "the bar must not be left short of the end"
+    )
+    assert not splash.isVisible(), "the splash outlived the window it covered"
+
+
+def test_a_failed_start_does_not_strand_the_splash(app, monkeypatch):
+    """A frameless window with no title bar and no way to close it is worse
+    than the crash it is sitting on top of."""
+    import nncm.gui.startup as startup
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("deliberate")
+
+    monkeypatch.setattr(startup.gui_theme, "apply_mpl_theme", explode)
+    before = {w for w in QApplication.topLevelWidgets()}
+    with pytest.raises(RuntimeError):
+        startup.run(None)
+    stranded = [
+        w for w in QApplication.topLevelWidgets()
+        if w not in before and type(w).__name__ == "Splash" and w.isVisible()
+    ]
+    assert not stranded, "the splash was left on screen after the start failed"

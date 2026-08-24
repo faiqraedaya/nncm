@@ -19,23 +19,21 @@ from typing import Any
 
 import pandas as pd
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QFrame,
-    QHBoxLayout,
     QHeaderView,
     QLineEdit,
     QPushButton,
     QScrollArea,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
-from .. import theme
+from .. import theme as T
 from ..config import Material, Range
 from ..pipeline import dataset_summary, run_phast_export, run_phast_import, run_sampling
 from ..predict import ModelBundle, format_quantity
@@ -50,7 +48,6 @@ from .widgets import (
     Explanation,
     Form,
     MetricCell,
-    PaneHeader,
     PathField,
     PlotArea,
     RangeField,
@@ -61,50 +58,81 @@ from .widgets import (
     integer_field,
     set_primary,
 )
-from . import style
+from . import layout as ly
+from . import theme as gui_theme
 
 CASE_KEY_COLUMNS = ["vessel_name", "material", "temperature_degC", "pressure_barg", "orifice_mm"]
-GUTTER = 14  # between top-level panes: a gutter, never a hairline splitter
 
 
-def gutter_splitter(orientation: Qt.Orientation = Qt.Horizontal) -> QSplitter:
-    splitter = QSplitter(orientation)
-    splitter.setHandleWidth(GUTTER)
-    splitter.setChildrenCollapsible(False)
-    return splitter
+def scroll_pane(content: QWidget) -> QScrollArea:
+    """A scrolling pane around one widget, with no edge of its own.
+
+    Horizontal scrolling is off: text wraps or elides, it never asks the
+    reader to scroll sideways to finish a sentence.
+    """
+    area = QScrollArea()
+    area.setWidgetResizable(True)   # fill the window when the content fits
+    area.setFrameShape(QFrame.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setWidget(content)
+    return area
 
 
 class Page(QWidget):
-    """A stage: a header, a body, and one action bar at the foot.
+    """A stage: a body, an inline status line, and one action bar at the foot.
+
+    The page does not draw its own title — the shell names the current page
+    once, in the shared content header, driven by the navigation. Five
+    separately-placed titles drift; one placement cannot.
 
     The body scrolls when the window is shorter than the stage needs. Without
     it Qt buys the missing height by compressing whatever will compress, and
     what compresses first is the explanation at the foot of a card — so a short
     window would silently cut a sentence in half rather than admit it ran out
-    of room. The header and the action bar stay put: the stage's one Primary is
-    never something you have to scroll to find.
+    of room. The status line and the action bar stay put: the stage's one
+    primary is never something you have to scroll to find, and neither is the
+    message saying why it did not work.
     """
 
     title = ""
 
+    # Two cards stacked, or one card holding a table with its metric row: the
+    # shortest arrangement any page here is legible at.
+    BODY_MIN_H = 340
+
+    #: Whether the whole body scrolls as one flow.
+    #:
+    #: True for a page that is a single column of cards taller than the window.
+    #: False for a page whose body is a splitter — a splitter can only hand out
+    #: height it has been given, and inside a scroll area it is given its own
+    #: minimum instead, so every pane collapses to its floor and the page
+    #: scrolls past panes that should have shared the screen. Those pages let
+    #: the panes that need it scroll individually.
+    scrolls = True
+
     def __init__(self, window):
         super().__init__()
         self.window = window
-        self._outer = QVBoxLayout(self)
-        self._outer.setContentsMargins(0, 12, 0, 0)
-        self._outer.setSpacing(GUTTER)
-        self._outer.addWidget(PaneHeader(self.title))
-        self.body = QVBoxLayout()
-        self.body.setSpacing(12)
+        self._outer = ly.vbox(self, spacing=T.SPACING_GROUP)
+        self.body = ly.vbox(spacing=T.SPACING_GROUP)
         content = QWidget()
         content.setLayout(self.body)
-        self.body.setContentsMargins(0, 0, 0, 0)
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)   # fill the window when it fits
-        self._scroll.setFrameShape(QFrame.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setWidget(content)
-        self._outer.addWidget(self._scroll, 1)
+        if self.scrolls:
+            self._scroll = scroll_pane(content)
+            # A floor for the body, so the window's minimum is a size the
+            # content is actually usable at. Without it Qt shrinks the page to
+            # nothing and the shortfall shows as a field sliced in half.
+            self._scroll.setMinimumHeight(self.BODY_MIN_H)
+            self._outer.addWidget(self._scroll, 1)
+        else:
+            self._scroll = None
+            content.setMinimumHeight(self.BODY_MIN_H)
+            self._outer.addWidget(content, 1)
+        # Validation and calculation failures report here, below the results
+        # and above the action that produced them — not in a modal, which
+        # would cover the figures the message is about.
+        self.status = ly.status_label()
+        self._outer.addWidget(self.status)
         self.actions = ActionBar()
         self._outer.addWidget(self.actions)
 
@@ -114,6 +142,26 @@ class Page(QWidget):
 
     def log(self, message: str) -> None:
         self.window.log(message)
+
+    def report_problem(self, message: str, role: str = "error") -> None:
+        """Say inline what went wrong, or clear it with an empty message."""
+        ly.set_status(self.status, message, role if message else "")
+
+    def fail(self, title: str, message: str, *controls) -> None:
+        """The one failure path: inline, busy released, controls handed back.
+
+        A calculation that did not work is not an interruption. The results
+        already on screen stay readable while the message is read, and the
+        message can be as long as it needs to be. The whole text goes to the
+        log, which is where the rest of a traceback belongs.
+        """
+        first = message.splitlines()[0] if message else "no detail given"
+        self.log(f"! {title}: {message}")
+        self.report_problem(f"{title}. {first}")
+        self.actions.clear_progress()
+        self.window.set_busy(False, title)
+        for control in controls:
+            control.setEnabled(True)
 
     def on_project_changed(self) -> None:
         """Refresh from the project on disk after it changes."""
@@ -145,11 +193,11 @@ MATERIAL_EDIT_COLUMN = len(MATERIAL_COLUMNS)
 
 class ProjectPage(Page):
     title = "Project"
+    scrolls = False   # the body is a splitter; each pane scrolls for itself
 
     def __init__(self, window):
         super().__init__(window)
-        top = QHBoxLayout()
-        top.setSpacing(GUTTER)
+        top = ly.hbox(spacing=T.SPACING_GROUP)
 
         design = Card("Sampling design")
         self.design_form = Form()
@@ -182,7 +230,13 @@ class ProjectPage(Page):
         ranges.add(self.ranges_form)
         ranges.body().addStretch(1)
         top.addWidget(ranges, 1)
-        self.body.addLayout(top)
+        settings_content = QWidget()
+        settings_content.setLayout(top)
+        # The settings scroll inside their own pane. With the explanations
+        # shown they are taller than half the window, and the alternative is
+        # for them to push the materials table off the foot of the page.
+        settings = scroll_pane(settings_content)
+        settings.setMinimumHeight(220)
 
         materials = Card("Materials")
         materials.add(
@@ -192,13 +246,11 @@ class ProjectPage(Page):
                 "ranges above. Double-click a row, or use Edit, to change one."
             )
         )
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
-        add_button = QPushButton("Add material")
-        add_button.clicked.connect(self._add_material)
-        remove_button = QPushButton("Remove")
-        remove_button.setToolTip("Remove the selected material from the design.")
-        remove_button.clicked.connect(self._remove_material)
+        toolbar = ly.hbox(spacing=T.SPACING_ROW)
+        add_button = ly.button("Add material", on_click=self._add_material,
+                               tip="Add a material to the sampling design.")
+        remove_button = ly.button("Remove", variant="danger", on_click=self._remove_material,
+                                  tip="Remove the selected material from the design.")
         toolbar.addWidget(add_button)
         toolbar.addStretch(1)
         # Remove sits apart from Add: both change the table, only one of them
@@ -217,22 +269,38 @@ class ProjectPage(Page):
         self.materials_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.materials_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.materials_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Wash, and only wash: gridlines as well would be two devices doing
+        # one job, and the wash costs no height and draws no line.
         self.materials_table.setShowGrid(False)
-        self.materials_table.setAlternatingRowColors(False)
+        self.materials_table.setAlternatingRowColors(True)
+        self.materials_table.setTextElideMode(Qt.ElideRight)
         self.materials_table.setFrameShape(QTableWidget.NoFrame)
         self.materials_table.verticalHeader().setVisible(False)
-        self.materials_table.verticalHeader().setDefaultSectionSize(theme.ROW_HEIGHT)
+        self.materials_table.verticalHeader().setDefaultSectionSize(T.ROW_HEIGHT)
         header = self.materials_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(False)
+        header.setTextElideMode(Qt.ElideRight)
         header.setSectionResizeMode(2, QHeaderView.Stretch)  # the elastic column
+        # The Edit column holds a cell widget, which ResizeToContents does not
+        # measure — left to itself the column collapses and the button clips.
         header.setSectionResizeMode(MATERIAL_EDIT_COLUMN, QHeaderView.Fixed)
-        self.materials_table.setColumnWidth(MATERIAL_EDIT_COLUMN, 68)
+        self.materials_table.setColumnWidth(MATERIAL_EDIT_COLUMN, 72)
+        _align_headers(self.materials_table, MATERIAL_NUMERIC_COLUMNS)
         # Tall enough to hold its own totals row without scrolling to it.
-        self.materials_table.setMinimumHeight(theme.ROW_HEIGHT * 7 + 44)
+        self.materials_table.setMinimumHeight(T.ROW_HEIGHT * 5 + 44)
         self.materials_table.cellDoubleClicked.connect(lambda row, _column: self._edit_material(row))
         materials.add(self.materials_table, 1)
-        self.body.addWidget(materials, 1)
+        # A splitter rather than a plain stack: the settings above are tall
+        # enough with their explanations shown to push the table off the foot
+        # of the page, and a materials list showing none of its materials is
+        # the landing page failing at the one thing it is for. The user can
+        # rebalance the two, and the table keeps a share by default.
+        self.body.addWidget(
+            ly.splitter(settings, materials, orientation=Qt.Vertical,
+                        sizes=[440, 360]),
+            1,
+        )
 
         self.actions.add_secondary(
             "Reload from disk", self._reload, "Discard edits and read nncm.json again."
@@ -240,6 +308,11 @@ class ProjectPage(Page):
         self.save_button = self.actions.add_primary(
             "Save configuration", self._save, "Write these settings to nncm.json."
         )
+
+    def _add_material(self) -> None:
+        dialog = MaterialDialog(Material("NEW MATERIAL"), self)
+        if dialog.exec():
+            self._fill_materials(self._material_rows() + [dialog.material()])
 
     # -- materials --------------------------------------------------------
     def _material_rows(self) -> list[Material]:
@@ -280,12 +353,11 @@ class ProjectPage(Page):
             item.setToolTip(text)
             if key in {"weight"} or key in MATERIAL_DETAIL:
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                item.setFont(style.tabular(item.font()))
+                item.setFont(gui_theme.tabular(item.font()))
             if column == MATERIAL_KEY_COLUMN:
                 item.setData(Qt.UserRole, material)
             table.setItem(row, column, item)
-        edit = QPushButton("Edit")
-        edit.setObjectName("Quiet")  # quiet until the pointer arrives
+        edit = ly.button("Edit", variant="quiet", tip="Open this material in full.")
         edit.clicked.connect(lambda _checked=False, r=row: self._edit_material(r))
         table.setCellWidget(row, MATERIAL_EDIT_COLUMN, edit)
 
@@ -301,18 +373,12 @@ class ProjectPage(Page):
             # boiling point is a figure that means nothing.
             item = QTableWidgetItem(cells.get(column, ""))
             item.setFlags(Qt.ItemIsEnabled)
-            item.setBackground(_alt_brush())
-            font = style.font(theme.FONT_BODY, theme.WEIGHT_SEMIBOLD, figures=True)
+            item.setBackground(_totals_brush())
+            font = gui_theme.font(T.FONT_BODY, T.WEIGHT_SEMIBOLD, figures=True)
             item.setFont(font)
             if column == 3:
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             table.setItem(row, column, item)
-
-    def _add_material(self) -> None:
-        dialog = MaterialDialog(Material("NEW MATERIAL"), self)
-        if dialog.exec():
-            materials = self._material_rows() + [dialog.material()]
-            self._fill_materials(materials)
 
     def _edit_material(self, row: int) -> None:
         materials = self._material_rows()
@@ -328,8 +394,9 @@ class ProjectPage(Page):
         materials = self._material_rows()
         keep = [m for index, m in enumerate(materials) if index not in rows]
         if len(keep) == len(materials):
-            self.window.report("Select a material row first.")
+            self.report_problem("Select a material row first.", "warning")
             return
+        self.report_problem("")
         self._fill_materials(keep)
 
     def set_detail_visible(self, visible: bool) -> None:
@@ -377,10 +444,29 @@ def _range_text(value: Range | None, absent: str) -> str:
     return f"{value.min:g} to {value.max:g}{spacing}"
 
 
-def _alt_brush():
-    from PySide6.QtGui import QBrush, QColor
+MATERIAL_NUMERIC_COLUMNS = frozenset(
+    index for index, (key, _) in enumerate(MATERIAL_COLUMNS)
+    if key == "weight" or key in MATERIAL_DETAIL
+)
 
-    return QBrush(QColor(theme.SURFACE_ALT))
+
+def _align_headers(table: QTableWidget, numeric_columns) -> None:
+    """A header aligns with the cells beneath it.
+
+    Centred headers over left-aligned data is the most common misalignment in
+    a Qt table, and the one a reader notices first.
+    """
+    for column in range(table.columnCount()):
+        item = table.horizontalHeaderItem(column)
+        if item is None:
+            continue
+        align = Qt.AlignRight if column in numeric_columns else Qt.AlignLeft
+        item.setTextAlignment(align | Qt.AlignVCenter)
+
+
+def _totals_brush():
+    """The totals row sits on the selected-surface rung, not on a grey."""
+    return QBrush(QColor(T.ink_hex(T.SURFACE_PRESSED)))
 
 
 # ---------------------------------------------------------------------------
@@ -388,16 +474,14 @@ def _alt_brush():
 # ---------------------------------------------------------------------------
 class SamplePage(Page):
     title = "Sampled cases"
+    scrolls = False   # the body is a splitter, and both panes fill the height
 
     def __init__(self, window):
         super().__init__(window)
         self._cases: pd.DataFrame | None = None
 
-        splitter = gutter_splitter()
         table_card = Card("Scenarios")
-        figures = QHBoxLayout()
-        figures.setContentsMargins(0, 0, 0, 0)
-        figures.setSpacing(0)
+        figures = ly.hbox(spacing=T.SPACING_GROUP)
         self.counts: dict[str, MetricCell] = {}
         for key, caption, tip in (
             ("scenarios", "Scenarios", "Leak scenarios in the design."),
@@ -418,10 +502,7 @@ class SamplePage(Page):
             "No design to draw yet. Generating cases also draws what they cover."
         )
         plot_card.add(self.plot, 1)
-        splitter.addWidget(table_card)
-        splitter.addWidget(plot_card)
-        splitter.setSizes([520, 680])
-        self.body.addWidget(splitter, 1)
+        self.body.addWidget(ly.splitter(table_card, plot_card, sizes=[520, 680]), 1)
 
         self.generate_button = self.actions.add_primary(
             "Generate cases",
@@ -449,7 +530,9 @@ class SamplePage(Page):
 
     def _generate(self) -> None:
         project = self.project
+        self.report_problem("")
         self.generate_button.setEnabled(False)
+        self.actions.show_running()
         self.window.begin_task("Generating cases")
         self.window.run_task(
             lambda log: run_sampling(project, log=log),
@@ -459,14 +542,14 @@ class SamplePage(Page):
 
     def _done(self, result: Any) -> None:
         self.generate_button.setEnabled(True)
+        self.actions.clear_progress()
         cases, _report = result
         self._show(cases)
         self.window.refresh_project_state()
         self.window.finish_task(f"Generated {len(cases):,} scenarios")
 
     def _failed(self, message: str) -> None:
-        self.generate_button.setEnabled(True)
-        self.window.show_failure("Sampling failed", message)
+        self.fail("Sampling failed", message, self.generate_button)
 
     def refresh_counts(self) -> None:
         cases = self._cases
@@ -509,10 +592,9 @@ class PhastPage(Page):
 
     def __init__(self, window):
         super().__init__(window)
-        top = QHBoxLayout()
-        top.setSpacing(GUTTER)
+        top = ly.hbox(spacing=T.SPACING_GROUP)
 
-        export = Card("1 - Write the input workbook")
+        export = Card("1 · Write the input workbook")
         export.add(
             Explanation(
                 "Writes the sampled cases into a copy of the Safeti template. "
@@ -532,7 +614,7 @@ class PhastPage(Page):
         export.body().addStretch(1)
         top.addWidget(export, 1)
 
-        extract = Card("2 - Read the result workbook")
+        extract = Card("2 · Read the result workbook")
         extract.add(
             Explanation(
                 "Joins the Discharge, Dispersion and Fire sheets back onto the "
@@ -550,9 +632,7 @@ class PhastPage(Page):
         self.body.addLayout(top)
 
         dataset = Card("Training dataset")
-        figures = QHBoxLayout()
-        figures.setContentsMargins(0, 0, 0, 0)
-        figures.setSpacing(0)
+        figures = ly.hbox(spacing=T.SPACING_GROUP)
         self.dataset_metrics: dict[str, MetricCell] = {}
         for key, caption, tip in (
             ("rows", "Rows", "Result rows available for training."),
@@ -592,12 +672,22 @@ class PhastPage(Page):
         self._move_primary()
 
     def _move_primary(self) -> None:
-        """One Primary on the surface, on the step the project is actually at."""
+        """One primary on the surface, on the step the project is actually at.
+
+        The buttons are reordered as well as restyled. The primary sits on the
+        trailing edge of the action bar on every other page, and a primary that
+        moved to the middle of a row here would be the one visible
+        inconsistency in the set.
+        """
         ready_to_extract = self.project.cases_path.exists() and any(
             self.project.phast_input_dir.glob("*.xlsx")
         )
         set_primary(self.import_button, ready_to_extract)
         set_primary(self.export_button, not ready_to_extract)
+        self.actions.order(
+            [self.export_button, self.import_button] if ready_to_extract
+            else [self.import_button, self.export_button]
+        )
 
     def refresh_dataset(self) -> None:
         summary = dataset_summary(self.project)
@@ -624,7 +714,9 @@ class PhastPage(Page):
         project = self.project
         project.config.phast.max_rows_per_workbook = self.split_rows.value()
         target = self.export_path.path()
+        self.report_problem("")
         self.export_button.setEnabled(False)
+        self.actions.show_running()
         self.window.begin_task("Writing the Phast workbook")
         self.window.run_task(
             lambda log: run_phast_export(project, output_path=target, log=log),
@@ -634,6 +726,7 @@ class PhastPage(Page):
 
     def _export_done(self, report) -> None:
         self.export_button.setEnabled(True)
+        self.actions.clear_progress()
         notes = [("subtle", f"Wrote {elide_middle(str(path), 60)}") for path in report.files]
         notes.append(
             ("subtle", f"{report.n_vessels:,} vessels and {report.n_leaks:,} leaks. Import this "
@@ -646,11 +739,17 @@ class PhastPage(Page):
     def _import(self) -> None:
         workbook = self.import_path.path()
         if workbook is None or not workbook.exists():
-            self.window.report("Choose a Phast result workbook first.")
+            self.report_problem(
+                "Choose a Phast result workbook first — the workbook Phast "
+                "exported after the run, holding the Discharge, Dispersion "
+                "and Fire sheets.", "warning"
+            )
             return
         project = self.project
         append = self.merge_box.isChecked()
+        self.report_problem("")
         self.import_button.setEnabled(False)
+        self.actions.show_running()
         self.window.begin_task("Reading the Phast results")
         self.window.run_task(
             lambda log: run_phast_import(project, workbook, log=log, append=append),
@@ -660,14 +759,14 @@ class PhastPage(Page):
 
     def _import_done(self, result: Any) -> None:
         self.import_button.setEnabled(True)
+        self.actions.clear_progress()
         frame, _report = result
         self.refresh_dataset()
         self.window.refresh_project_state()
         self.window.finish_task(f"Extracted {len(frame):,} rows")
 
     def _failed(self, button: QPushButton, title: str, message: str) -> None:
-        button.setEnabled(True)
-        self.window.show_failure(title, message)
+        self.fail(title, message, button)
 
 
 # ---------------------------------------------------------------------------
@@ -688,8 +787,7 @@ class TrainPage(Page):
                 "land on both sides of the split and the scores stay honest."
             )
         )
-        columns = QHBoxLayout()
-        columns.setSpacing(GUTTER)
+        columns = ly.hbox(spacing=T.SPACING_SECTION)
         left, right = Form(), Form()
         self.epochs = integer_field(1, 10_000, 400)
         self.batch_size = integer_field(8, 8192, 256)
@@ -716,17 +814,13 @@ class TrainPage(Page):
         settings.add_layout(columns)
         self.body.addWidget(settings)
 
-        splitter = gutter_splitter()
         scores = Card("Scores on held-out vessels")
         self.metrics = DataTable("No run yet. Train a model to score it here.")
         scores.add(self.metrics, 1)
         parity = Card("Predicted against Phast")
         self.plot = PlotArea("No run yet. Training draws a parity plot for every target.")
         parity.add(self.plot, 1)
-        splitter.addWidget(scores)
-        splitter.addWidget(parity)
-        splitter.setSizes([520, 680])
-        self.body.addWidget(splitter, 1)
+        self.body.addWidget(ly.splitter(scores, parity, sizes=[520, 680]), 1)
 
         self.notes = Advisories()
         self.body.addWidget(self.notes)
@@ -787,11 +881,15 @@ class TrainPage(Page):
         from ..training import train_model
 
         if not self.project.training_data_path.exists():
-            self.window.report("There is no dataset to train on yet — read a Phast result first.")
+            self.report_problem(
+                "There is no dataset to train on yet. Read a Phast result "
+                "workbook on the Phast page to build one.", "warning"
+            )
             return
         project = self.project
         config = self.collect()
         project.save_config()
+        self.report_problem("")
         self.train_button.setEnabled(False)
         self.notes.show_notes([])
         self.actions.show_progress(0, config.epochs, "epochs")
@@ -822,9 +920,7 @@ class TrainPage(Page):
         )
 
     def _failed(self, message: str) -> None:
-        self.train_button.setEnabled(True)
-        self.actions.clear_progress()
-        self.window.show_failure("Training failed", message)
+        self.fail("Training failed", message, self.train_button)
 
     # -- results ----------------------------------------------------------
     def _show_metrics(self, metrics: dict) -> None:
@@ -884,22 +980,17 @@ STABILITY_CLASSES = ["A", "B", "C", "D", "E", "F"]
 
 class PredictPage(Page):
     title = "Predict"
+    scrolls = False   # the body is a splitter; the input column scrolls itself
 
     def __init__(self, window):
         super().__init__(window)
         self.bundle: ModelBundle | None = None
 
-        splitter = gutter_splitter()
-
         left = QWidget()
-        left_column = QVBoxLayout(left)
-        left_column.setContentsMargins(0, 0, 0, 0)
-        left_column.setSpacing(12)
+        left_column = ly.vbox(left, spacing=T.SPACING_GROUP)
 
         model_card = Card("Model")
-        figures = QHBoxLayout()
-        figures.setContentsMargins(0, 0, 0, 0)
-        figures.setSpacing(0)
+        figures = ly.hbox(spacing=T.SPACING_GROUP)
         self.model_metrics: dict[str, MetricCell] = {}
         for key, caption, tip in (
             ("run", "Run", "The trained run currently loaded."),
@@ -934,21 +1025,18 @@ class PredictPage(Page):
         inputs.add(form)
         inputs.body().addStretch(1)
         left_column.addWidget(inputs, 1)
-        splitter.addWidget(left)
+        left = scroll_pane(left)
+        left.setMinimumWidth(420)
 
         right = QWidget()
-        right_column = QVBoxLayout(right)
-        right_column.setContentsMargins(0, 0, 0, 0)
-        right_column.setSpacing(12)
+        right_column = ly.vbox(right, spacing=T.SPACING_GROUP)
         results = Card("Predicted consequences")
         self.results = DataTable("Nothing predicted yet. Set the inputs, then Predict.")
         results.add(self.results, 1)
         right_column.addWidget(results, 1)
         self.domain_notes = Advisories()
         right_column.addWidget(self.domain_notes)
-        splitter.addWidget(right)
-        splitter.setSizes([460, 740])
-        self.body.addWidget(splitter, 1)
+        self.body.addWidget(ly.splitter(left, right, sizes=[460, 740]), 1)
 
         self.batch_button = self.actions.add_secondary(
             "Predict from CSV", self._predict_csv, "Predict every row of a CSV and write the results beside it."
@@ -1055,14 +1143,18 @@ class PredictPage(Page):
 
     def _predict(self) -> None:
         if self.bundle is None:
-            self.window.report("No model is loaded yet.")
+            self.report_problem(
+                "No model is loaded yet. Train one on the Train page, or open "
+                "a project that already has a run.", "warning"
+            )
             return
+        self.report_problem("")
         try:
             prediction = self.bundle.predict_one(
                 self._inputs(), mc_samples=self.mc_samples.value()
             )
         except Exception as exc:
-            self.window.show_failure("Prediction failed", str(exc))
+            self.fail("Prediction failed", str(exc))
             return
 
         rows = []
@@ -1092,8 +1184,12 @@ class PredictPage(Page):
         from PySide6.QtWidgets import QFileDialog
 
         if self.bundle is None:
-            self.window.report("No model is loaded yet.")
+            self.report_problem(
+                "No model is loaded yet. Train one on the Train page, or open "
+                "a project that already has a run.", "warning"
+            )
             return
+        self.report_problem("")
         chosen, _filter = QFileDialog.getOpenFileName(
             self, "Select a CSV of input rows", str(self.project.root), "CSV files (*.csv)"
         )
@@ -1106,7 +1202,7 @@ class PredictPage(Page):
             target = path.with_name(path.stem + "_predictions.csv")
             pd.concat([frame, predictions], axis=1).to_csv(target, index=False)
         except Exception as exc:
-            self.window.show_failure("Batch prediction failed", str(exc))
+            self.fail("Batch prediction failed", str(exc))
             return
         self.log(f"predicted {len(frame)} rows -> {target}")
         self.domain_notes.show_notes(

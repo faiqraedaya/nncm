@@ -88,7 +88,25 @@ def write_input_workbook(
     Splits into several workbooks when ``config.max_rows_per_workbook`` is set,
     because Phast's importer slows to a crawl on very large sheets.
     """
-    template_path = Path(template or config.template)
+    template_path = Path(template) if template else config.template_path()
+    if not template_path.is_file():
+        # Checked once here, naming the setting the user has to change. Left to
+        # the workbook reader it surfaces as a bare missing-file path, several
+        # frames down, with nothing saying which of the two workbooks on this
+        # page it was or what to do about it.
+        custom = bool(config.template) and template is None
+        raise FileNotFoundError(
+            f"The Safeti template was not found at {template_path}. "
+            + (
+                'This project names its own template — set "template" in '
+                "nncm.json to a workbook that exists, or clear it to fall "
+                "back to the one that ships with NNCM."
+                if custom
+                else "The template that ships with NNCM is missing from its "
+                "installation; reinstall it, or point the project at a copy "
+                'by setting "template" in nncm.json.'
+            )
+        )
     output_path = Path(output_path)
     report = WriteReport()
 

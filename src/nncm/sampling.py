@@ -303,7 +303,8 @@ def plot_case_distributions(cases: pd.DataFrame, out_path: Path | None = None):
         theme.rounded_barh(ax_materials, position, float(value), height, colour)
         ax_materials.text(
             float(value) + largest * 0.03, position, f"{int(value):,}",
-            va="center", ha="left", fontsize=theme.FONT_CAPTION, color=theme.SUBTLE,
+            va="center", ha="left", fontsize=theme.pt(theme.FONT_CAPTION),
+                color=theme.ink_hex(theme.INK_SECONDARY),
         )
     ax_materials.set_yticks(positions, list(shown.index))
     ax_materials.set_title("Vessels per material")

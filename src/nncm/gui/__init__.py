@@ -6,6 +6,11 @@ from pathlib import Path
 
 
 def launch(project_root: Path | None = None) -> int:
-    from .app import run
+    """Open the desktop application.
+
+    Deferred so that importing :mod:`nncm.gui` — which the CLI does merely to
+    find this function — does not drag in the whole widget stack.
+    """
+    from .startup import run
 
     return run(project_root)

@@ -11,16 +11,44 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parents[1]
-DEFAULT_TEMPLATE = REPO_ROOT / "templates" / "Safeti Template Input Sheet.xlsx"
+
+TEMPLATE_NAME = "Safeti Template Input Sheet.xlsx"
+
+
+def shipped_template() -> Path:
+    """Where the template that ships with the application lives.
+
+    Resolved on every call rather than frozen into a constant at import time,
+    and never written into a project's configuration: a path to a file inside
+    the installation is only true for the machine and the directory it was
+    computed on. Stored in ``nncm.json`` it breaks as soon as the checkout
+    moves, the project is opened elsewhere, or the app is frozen.
+    """
+    bundle_root = getattr(sys, "_MEIPASS", None)  # PyInstaller unpack directory
+    if bundle_root:
+        bundled = Path(bundle_root) / "templates" / TEMPLATE_NAME
+        if bundled.is_file():
+            return bundled
+    return REPO_ROOT / "templates" / TEMPLATE_NAME
+
+
+DEFAULT_TEMPLATE = shipped_template()
+"""The shipped template, as resolved at import time.
+
+Kept for callers that want the path itself. Anything reading a *project's*
+template must go through :meth:`PhastConfig.template_path`, which falls back to
+the shipped one when the project does not name a template of its own.
+"""
 
 CONFIG_FILENAME = "nncm.json"
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +386,15 @@ class SamplingConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class PhastConfig:
-    template: str = str(DEFAULT_TEMPLATE)
+    template: str = ""
+    """A workbook to use instead of the shipped template.
+
+    Empty — the default — means the template that ships with the application,
+    resolved at use time by :meth:`template_path`. The shipped template's own
+    path is deliberately never stored here: it is an absolute path into the
+    installation directory, so a project carrying it stops working the moment
+    the checkout moves or the project is opened on another machine.
+    """
     study_name: str = "Study"
     folder_name: str = ""
     """Optional model folder for the generated equipment. Empty keeps the study
@@ -391,6 +427,10 @@ class PhastConfig:
     verify_after_write: bool = True
     """Re-open each written workbook and check the values read back. Catches a
     malformed export here rather than at the Phast import dialog."""
+
+    def template_path(self) -> Path:
+        """The workbook this project writes into: its own, or the shipped one."""
+        return Path(self.template) if self.template else shipped_template()
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +549,30 @@ _RETIRED_PHAST_DEFAULTS = {
 _RETIRED_PHAST_VALUES = {"folder_name": ("NNCM", "")}
 
 
+def _drop_stale_template(phast: dict[str, Any]) -> None:
+    """Forget a stored path that is really just the shipped template.
+
+    Versions up to 4 wrote the shipped template's absolute path into every
+    project. That path is only true for the machine and the directory it was
+    computed on, so moving the checkout left projects pointing at a file that
+    was never theirs to name.
+
+    Cleared only when the stored path no longer resolves *and* carries the
+    shipped template's own filename. A project naming a genuinely custom
+    workbook keeps it, and still reports it missing if it has moved — that is
+    a path the user chose, and silently swapping it for a different template
+    would change what gets exported.
+    """
+    stored = phast.get("template")
+    if not isinstance(stored, str) or not stored:
+        return
+    path = Path(stored)
+    if path.name != TEMPLATE_NAME:
+        return          # a custom template: the user's to fix, not ours
+    if path == shipped_template() or not path.is_file():
+        phast["template"] = ""
+
+
 def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     """Bring an older ``nncm.json`` up to the current schema."""
     version = int(data.get("version", 1) or 1)
@@ -532,6 +596,8 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
             # That leaves vessels pointing at materials the study never defines,
             # which is an incomplete model — always declare them.
             phast["write_material_rows"] = True
+        if version < 5:
+            _drop_stale_template(phast)
 
     data["version"] = CONFIG_VERSION
     return data

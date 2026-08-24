@@ -60,7 +60,7 @@ def run_phast_export(
         from .phast.patcher import TemplatePatcher
 
         target = Path(output_path or project.phast_input_dir / "template_passthrough.xlsx")
-        with TemplatePatcher(project.config.phast.template) as patcher:
+        with TemplatePatcher(project.config.phast.template_path()) as patcher:
             saved = patcher.save(target)
         emit(f"wrote an unmodified copy of the template to {saved}")
         return WriteReport(files=[saved], verified=True)

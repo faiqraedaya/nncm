@@ -1,13 +1,16 @@
 """The pieces every page is built from.
 
-A component here reaches only for role tokens, never a raw value, and hides
-itself when it has nothing to say. The rules it exists to keep:
+A component here reaches only for tokens and the factories in
+:mod:`nncm.gui.layout`, never a raw value, and hides itself when it has
+nothing to say. The rules it exists to keep:
 
-* a container owns its edge — a table inside a card draws no border of its own;
+* a container owns its edge — a table inside a panel draws no border of its own;
 * every figure carries a name and a unit, taken from :mod:`nncm.quantities`, so
   a label and its explanation cannot drift apart;
 * a table sorts on double-click, by model values, blanks last, and its totals
   live inside it as its last row;
+* every cell and every column header carries its full text as a tooltip, because
+  both elide;
 * an empty view says what is absent, in a sentence.
 """
 
@@ -22,7 +25,6 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
-    QSize,
     QSortFilterProxyModel,
     Qt,
 )
@@ -34,8 +36,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
-    QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -44,22 +45,17 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTableView,
-    QVBoxLayout,
     QWidget,
 )
 
-from .. import theme
+from .. import theme as T
 from ..quantities import Quantity, describe
-from . import style
+from . import layout as ly
+from . import theme as gui_theme
 
-# Padding, translated from the guide's CSS order (top/right/bottom/left) into
-# Qt's (left, top, right, bottom).
-WINDOW_MARGINS = (12, 16, 16, 16)
-CARD_MARGINS = (14, 16, 12, 16)
-METRIC_MARGINS = (14, 12, 12, 12)
-
-NAME_COLUMN_FLOOR = 140   # below this a name stops identifying its row
+NAME_COLUMN_FLOOR = 140    # below this a name stops identifying its row
 NAME_COLUMN_CEILING = 320  # above it, the name is stealing width from figures
+VALUE_COLUMN_FLOOR = 88    # a figure column never narrower than its own header
 
 
 # ---------------------------------------------------------------------------
@@ -100,21 +96,6 @@ def is_number(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 # Type and containers
 # ---------------------------------------------------------------------------
-class PaneHeader(QLabel):
-    """A label and nothing else. Space does the separating, not a rule."""
-
-    def __init__(self, text: str, parent: QWidget | None = None):
-        super().__init__(text, parent)
-        self.setObjectName("PaneHeader")
-
-
-class Caption(QLabel):
-    def __init__(self, text: str = "", parent: QWidget | None = None):
-        super().__init__(text, parent)
-        self.setObjectName("Caption")
-        self.setWordWrap(True)
-
-
 class Explanation(QLabel):
     """The one job italic has: a sentence saying what a setting changes.
 
@@ -131,7 +112,7 @@ class Explanation(QLabel):
 
     def __init__(self, text: str = "", parent: QWidget | None = None):
         super().__init__(text, parent)
-        self.setObjectName("Explanation")
+        self.setProperty("role", "explanation")
         self.setWordWrap(True)
         policy = self.sizePolicy()
         policy.setHeightForWidth(True)
@@ -156,31 +137,17 @@ class Explanation(QLabel):
             self.setMinimumHeight(self.heightForWidth(self.width()))
 
 
-class EmptyState(QLabel):
-    """What is absent, and why — never a blank rectangle, never "No data"."""
-
-    def __init__(self, text: str, parent: QWidget | None = None):
-        super().__init__(text, parent)
-        self.setObjectName("EmptyState")
-        self.setAlignment(Qt.AlignCenter)
-        self.setWordWrap(True)
-
-
 class Card(QFrame):
-    """One surface for one subject. Content inside it stays borderless."""
+    """One bordered surface for one subject. Content inside it stays borderless."""
 
     def __init__(self, title: str = "", parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("Card")
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(*CARD_MARGINS)
-        self._layout.setSpacing(12)
+        self.setProperty("role", "panel")
+        self._layout = ly.vbox(self, margin=T.MARGIN_GROUP, spacing=T.SPACING_ROW)
         if title:
-            heading = QLabel(title)
-            heading.setObjectName("CardTitle")
-            self._layout.addWidget(heading)
+            self._layout.addWidget(ly.heading(title))
 
-    def body(self) -> QVBoxLayout:
+    def body(self):
         return self._layout
 
     def add(self, widget: QWidget, stretch: int = 0) -> QWidget:
@@ -199,19 +166,12 @@ class MetricCell(QWidget):
 
     def __init__(self, caption: str, help_text: str = "", parent: QWidget | None = None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(*METRIC_MARGINS)
-        layout.setSpacing(2)
-        self._caption = QLabel(caption)
-        self._caption.setObjectName("MetricCaption")
-        self._value = QLabel("")
-        self._value.setObjectName("MetricValue")
-        self._value.setFont(style.font(theme.FONT_METRIC, theme.WEIGHT_MEDIUM, figures=True))
-        self._unit = QLabel("")
-        self._unit.setObjectName("MetricUnit")
-        figure = QHBoxLayout()
-        figure.setContentsMargins(0, 0, 0, 0)
-        figure.setSpacing(4)
+        layout = ly.vbox(self, spacing=2)
+        self._caption = ly.caption(caption)
+        self._value = ly.metric_value("")
+        self._value.setFont(gui_theme.font(T.FONT_METRIC, T.WEIGHT_MEDIUM, figures=True))
+        self._unit = ly.unit_label("")
+        figure = ly.hbox(spacing=4)
         figure.addWidget(self._value)
         figure.addWidget(self._unit, 0, Qt.AlignBottom)
         figure.addStretch(1)
@@ -252,16 +212,16 @@ _NO_WHEEL = _NoWheel()
 
 
 def _prepare_numeric(box) -> None:
-    # Right-aligned, wide enough for the longest realistic value: a figure
-    # showing its own tail is worse than no figure. The steppers are off
-    # because styling a Qt spin box sub-control replaces the native ones, and
-    # a painted arrow is one more decorative asset to keep working for a
+    # Right-aligned, and never narrower than the longest realistic value: a
+    # figure showing its own tail is worse than no figure. The steppers are
+    # off because styling a Qt spin box sub-control replaces the native ones,
+    # and a painted arrow is one more decorative asset to keep working for a
     # gesture the keyboard already offers.
     box.setButtonSymbols(box.ButtonSymbols.NoButtons)
     box.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    box.setMinimumWidth(104)
-    box.setMaximumWidth(168)
-    box.setFont(style.tabular(box.font()))
+    ly.value_field(box)
+    box.setMaximumWidth(T.FIELD_MIN_W + 40)
+    box.setFont(gui_theme.tabular(box.font()))
     box.setFocusPolicy(Qt.StrongFocus)
     box.installEventFilter(_NO_WHEEL)
 
@@ -291,12 +251,18 @@ def choice_field(options: Iterable[str], current: str = "") -> QComboBox:
     box.addItems(list(options))
     if current:
         box.setCurrentText(current)
+    box.setMinimumWidth(T.FIELD_MIN_W)
     box.installEventFilter(_NO_WHEEL)
     return box
 
 
 class PathField(QWidget):
-    """A path and the one control that changes it."""
+    """A path and the one control that changes it.
+
+    The path elides from the middle and carries the whole thing as a tooltip:
+    both ends identify a file, the middle does not, and a path that is only
+    half readable is a path the user cannot check.
+    """
 
     def __init__(
         self,
@@ -309,13 +275,10 @@ class PathField(QWidget):
         self._caption = caption
         self._mode = mode
         self._filter = file_filter
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout = ly.hbox(self, spacing=T.SPACING_ROW)
         self.edit = QLineEdit()
         self.edit.setPlaceholderText("Not set")
-        self.button = QPushButton("Browse")
-        self.button.clicked.connect(self._browse)
+        self.button = ly.button("Browse", on_click=self._browse, tip=caption)
         layout.addWidget(self.edit, 1)
         layout.addWidget(self.button)
 
@@ -328,7 +291,7 @@ class PathField(QWidget):
         else:
             chosen, _ = QFileDialog.getOpenFileName(self, self._caption, start, self._filter)
         if chosen:
-            self.edit.setText(chosen)
+            self.set_path(chosen)
 
     def path(self) -> Path | None:
         text = self.edit.text().strip()
@@ -344,17 +307,14 @@ class RangeField(QWidget):
 
     def __init__(self, low: float, high: float, decimals: int = 3, parent: QWidget | None = None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout = ly.hbox(self, spacing=T.SPACING_ROW)
         self.minimum = decimal_field(low, high, low, decimals)
         self.maximum = decimal_field(low, high, high, decimals)
-        joiner = QLabel("to")
-        joiner.setObjectName("Unit")
         self.log = QCheckBox("Log-spaced")
         self.log.setToolTip(describe("log_spacing").help)
         layout.addWidget(self.minimum)
-        layout.addWidget(joiner)
+        # No divider between a floor and its ceiling: they are one quantity.
+        layout.addWidget(ly.unit_label("to"))
         layout.addWidget(self.maximum)
         layout.addWidget(self.log)
         layout.addStretch(1)
@@ -372,15 +332,16 @@ class Form(QWidget):
     """One row is label, editor, unit — with the explanation under both columns.
 
     Every label, unit and sentence comes from :mod:`nncm.quantities`, so there
-    is only ever one copy of each to keep true.
+    is only ever one copy of each to keep true. A grid rather than a
+    ``QFormLayout`` because the units have to line up in their own column: a
+    clipped or drifting unit changes what the number means.
     """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._grid = QGridLayout(self)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(12)
-        self._grid.setVerticalSpacing(9)
+        self._grid = ly.grid(self)
+        self._grid.setHorizontalSpacing(T.SPACING_GROUP)
+        self._grid.setVerticalSpacing(T.SPACING_ROW)
         # The editor column takes the width it needs and the unit follows it;
         # a number stranded at the far side of the pane has lost its label.
         self._grid.setColumnStretch(2, 1)
@@ -392,19 +353,19 @@ class Form(QWidget):
         self.setSizePolicy(policy)
         self._row = 0
 
-    def add(self, key: str, editor: QWidget, *, span: bool = False, label: str | None = None) -> QWidget:
+    def add(self, key: str, editor: QWidget, *, span: bool = False,
+            label: str | None = None) -> QWidget:
         quantity: Quantity = describe(key)
-        name = QLabel(label if label is not None else quantity.label)
-        name.setObjectName("FieldLabel")
-        name.setWordWrap(True)  # wrap the label rather than clip the field
+        name = ly.field_label(label if label is not None else quantity.label)
         name.setBuddy(editor)
+        if quantity.help:
+            name.setToolTip(quantity.help)
         self._grid.addWidget(name, self._row, 0, Qt.AlignLeft | Qt.AlignVCenter)
         if span:
             self._grid.addWidget(editor, self._row, 1, 1, 2)
         else:
             self._grid.addWidget(editor, self._row, 1)
-            unit = QLabel(quantity.unit)
-            unit.setObjectName("Unit")
+            unit = ly.unit_label(quantity.unit)
             unit.setMinimumWidth(56)  # units line up down the pane
             self._grid.addWidget(unit, self._row, 2, Qt.AlignLeft | Qt.AlignVCenter)
         self._row += 1
@@ -436,66 +397,49 @@ class Form(QWidget):
 # Advisory notes
 # ---------------------------------------------------------------------------
 class Advisories(QWidget):
-    """A dot beside a sentence. With nothing to report, the block hides itself."""
+    """Inline notes about the state of the project.
+
+    Each is a tinted banner carrying its severity in words as well as in
+    colour — a coloured dot beside a sentence puts the severity on colour
+    alone, which is exactly what the accessibility rule forbids. With nothing
+    to report the whole block hides itself and takes no height.
+    """
+
+    _ROLES = {"subtle": "", "warning": "warning", "danger": "error",
+              "error": "error", "success": "success"}
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
+        self._layout = ly.vbox(self, spacing=T.SPACING_ROW // 2)
         self.hide()
 
     def show_notes(self, notes: Sequence[tuple[str, str]]) -> None:
-        """``notes`` is a sequence of (severity, sentence); severity is a token name."""
+        """``notes`` is a sequence of (severity, sentence)."""
         while self._layout.count():
             item = self._layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         for severity, sentence in notes:
-            self._layout.addWidget(_Advisory(severity, sentence))
+            role = self._ROLES.get(severity, "")
+            self._layout.addWidget(ly.status_label(sentence, role))
         self.setVisible(bool(notes))
-
-
-class _Advisory(QWidget):
-    _COLOURS = {"subtle": theme.SUBTLE, "warning": theme.WARNING, "danger": theme.DANGER}
-
-    def __init__(self, severity: str, sentence: str, parent: QWidget | None = None):
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        dot = QLabel()
-        dot.setFixedSize(QSize(8, 8))
-        colour = self._COLOURS.get(severity, theme.SUBTLE)
-        dot.setStyleSheet(f"background: {colour}; border-radius: 4px;")
-        # Held in a top-aligned spacer so the dot sits on the first line of a
-        # message that wraps.
-        holder = QVBoxLayout()
-        holder.setContentsMargins(0, 4, 0, 0)
-        holder.addWidget(dot)
-        holder.addStretch(1)
-        layout.addLayout(holder)
-        text = QLabel(sentence)
-        text.setWordWrap(True)
-        text.setObjectName("FieldLabel")
-        layout.addWidget(text, 1)
 
 
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
 class ActionBar(QFrame):
-    """Where a stage's actions live: reversible on the left, the one Primary on the right.
+    """Where a stage's actions live.
 
-    Reading surfaces carry no buttons, so the figures get the whole width.
+    One placement, on every page: secondary actions in reading order, then the
+    single primary last on the trailing edge. Reading surfaces carry no buttons
+    at all, so the figures get the whole width.
     """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setObjectName("ActionBar")
-        self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(8)
+        self.setProperty("role", "bare")
+        self._layout = ly.hbox(self, spacing=T.SPACING_ROW)
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
         self._progress.setMaximumWidth(260)
@@ -504,22 +448,26 @@ class ActionBar(QFrame):
         self._layout.addStretch(1)
 
     def add_secondary(self, text: str, on_click: Callable[[], None], tip: str = "") -> QPushButton:
-        """A reversible action. Added in reading order, left of the Primary."""
-        button = QPushButton(text)
-        button.clicked.connect(on_click)
-        if tip:
-            button.setToolTip(tip)
+        """A reversible action. Added in reading order, left of the primary."""
+        button = ly.button(text, on_click=on_click, tip=tip)
         self._layout.addWidget(button)
         return button
 
     def add_primary(self, text: str, on_click: Callable[[], None], tip: str = "") -> QPushButton:
-        button = QPushButton(text)
-        button.setProperty("primary", "true")
-        button.clicked.connect(on_click)
-        if tip:
-            button.setToolTip(tip)
+        button = ly.button(text, variant="primary", on_click=on_click, tip=tip)
         self._layout.addWidget(button)
         return button
+
+    def order(self, buttons: Sequence[QPushButton]) -> None:
+        """Re-lay the buttons in the given order, trailing edge last.
+
+        Used where which action is primary depends on the project's state: the
+        primary has to stay on the trailing edge, or its placement drifts
+        between pages.
+        """
+        for button in buttons:
+            self._layout.removeWidget(button)
+            self._layout.addWidget(button)
 
     def show_progress(self, done: int, total: int, unit: str = "") -> None:
         """Stepped progress: every step is a thing that actually finished."""
@@ -528,16 +476,21 @@ class ActionBar(QFrame):
         self._progress.setFormat(f"%v of at most %m {unit}".strip())
         self._progress.show()
 
+    def show_running(self) -> None:
+        """An indeterminate bar, shown at its final position, never animated in."""
+        self._progress.setRange(0, 0)
+        self._progress.setFormat("")
+        self._progress.show()
+
     def clear_progress(self) -> None:
         self._progress.hide()
+        self._progress.setRange(0, 1)
         self._progress.reset()
 
 
 def set_primary(button: QPushButton, primary: bool) -> None:
-    """Move the single Primary between two buttons as the project's state moves."""
-    button.setProperty("primary", "true" if primary else None)
-    button.style().unpolish(button)
-    button.style().polish(button)
+    """Move the single primary between two buttons as the project's state moves."""
+    ly.set_variant(button, "primary" if primary else None)
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +508,11 @@ class LogView(QPlainTextEdit):
         self.setReadOnly(True)
         self.setMaximumBlockCount(5000)
         self.setFrameShape(QFrame.NoFrame)
-        self.setFont(style.font(theme.FONT_UNIT, mono=True))
+        self.setFont(gui_theme.font(T.FONT_CAPTION, mono=True))
         self.setPlaceholderText("Nothing has run yet in this session.")
+        # Four lines: fewer and the newest message scrolls out of sight as it
+        # arrives, which is the one thing a running log must not do.
+        self.setMinimumHeight(T.ROW_HEIGHT * 3)
 
     def append_line(self, text: str) -> None:
         for line in str(text).rstrip("\n").split("\n"):
@@ -576,11 +532,10 @@ class PlotArea(QFrame):
 
     def __init__(self, empty_text: str = "Nothing to plot yet.", parent: QWidget | None = None):
         super().__init__(parent)
-        self.setFrameShape(QFrame.NoFrame)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
+        self.setProperty("role", "bare")
+        self._layout = ly.vbox(self)
         self._canvas = None
-        self._empty = EmptyState(empty_text)
+        self._empty = ly.empty_state(empty_text)
         self._layout.addWidget(self._empty)
 
     def show_message(self, text: str) -> None:
@@ -593,8 +548,9 @@ class PlotArea(QFrame):
 
         self._drop_canvas()
         self._empty.hide()
+        # The figure's own facecolor is the canvas token, so the widget needs
+        # no style sheet of its own to sit on the same ground.
         self._canvas = FigureCanvasQTAgg(figure)
-        self._canvas.setStyleSheet(f"background: {theme.SURFACE};")
         self._layout.addWidget(self._canvas)
         self._canvas.draw_idle()
 
@@ -624,8 +580,8 @@ class FrameModel(QAbstractTableModel):
         self._frame = pd.DataFrame()
         self._totals: dict[str, Any] = {}
         self._numeric: list[bool] = []
-        self._figures = style.font(theme.FONT_BODY, figures=True)
-        self._bold = style.font(theme.FONT_BODY, theme.WEIGHT_SEMIBOLD, figures=True)
+        self._figures = gui_theme.font(T.FONT_BODY, figures=True)
+        self._bold = gui_theme.font(T.FONT_BODY, T.WEIGHT_SEMIBOLD, figures=True)
 
     # -- data ------------------------------------------------------------
     def set_frame(self, frame: pd.DataFrame, totals: dict[str, Any] | None = None) -> None:
@@ -633,7 +589,8 @@ class FrameModel(QAbstractTableModel):
         self._frame = frame.reset_index(drop=True)
         self._totals = dict(totals or {})
         self._numeric = [
-            pd.api.types.is_numeric_dtype(self._frame[c]) and not pd.api.types.is_bool_dtype(self._frame[c])
+            pd.api.types.is_numeric_dtype(self._frame[c])
+            and not pd.api.types.is_bool_dtype(self._frame[c])
             for c in self._frame.columns
         ]
         self.endResetModel()
@@ -644,6 +601,9 @@ class FrameModel(QAbstractTableModel):
 
     def is_totals(self, row: int) -> bool:
         return bool(self._totals) and row == len(self._frame)
+
+    def is_numeric(self, column: int) -> bool:
+        return bool(self._numeric[column]) if 0 <= column < len(self._numeric) else False
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._frame) + (1 if self._totals else 0)
@@ -664,6 +624,7 @@ class FrameModel(QAbstractTableModel):
         row, column = index.row(), index.column()
         value = self._value(row, column)
         if role in (Qt.DisplayRole, Qt.ToolTipRole):
+            # The tooltip carries the same full text, because the cell elides.
             text = format_number(value)
             if self.is_totals(row) and column == 0 and not text:
                 return ""
@@ -678,7 +639,7 @@ class FrameModel(QAbstractTableModel):
                 return self._bold
             return self._figures if self._numeric[column] else None
         if role == Qt.BackgroundRole and self.is_totals(row):
-            return QColor(theme.SURFACE_ALT)
+            return QColor(T.ink_hex(T.SURFACE_PRESSED))
         return None
 
     def flags(self, index: QModelIndex):
@@ -693,7 +654,13 @@ class FrameModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             return quantity.with_unit()
         if role == Qt.ToolTipRole:
+            # Headers elide as readily as cells, so each carries its own text.
             return quantity.help or quantity.with_unit()
+        if role == Qt.TextAlignmentRole:
+            # A header aligns with the cells beneath it. Centred headers over
+            # left-aligned data is the most common misalignment in Qt tables.
+            align = Qt.AlignRight if self.is_numeric(section) else Qt.AlignLeft
+            return int(align | Qt.AlignVCenter)
         return None
 
 
@@ -729,7 +696,7 @@ class SortProxy(QSortFilterProxyModel):
 
 
 class DataTable(QWidget):
-    """A reading surface: no gridlines, no buttons, one hairline under each row.
+    """A reading surface: alternating row wash, no gridlines, no cell borders.
 
     Sorts on **double**-click, cycling ascending, descending, then back to the
     model's own order — a single click on the way to dragging a column edge
@@ -747,8 +714,11 @@ class DataTable(QWidget):
 
         self.view = QTableView()
         self.view.setModel(self._proxy)
+        # Wash, and only wash: gridlines as well would be two devices doing
+        # one job, and the wash costs no height and draws no line.
         self.view.setShowGrid(False)
-        self.view.setAlternatingRowColors(False)
+        self.view.setAlternatingRowColors(True)
+        self.view.setTextElideMode(Qt.ElideRight)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setSelectionMode(QAbstractItemView.SingleSelection)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -756,17 +726,17 @@ class DataTable(QWidget):
         self.view.setWordWrap(False)
         self.view.setSortingEnabled(False)  # our own gesture, see below
         self.view.verticalHeader().setVisible(False)
-        self.view.verticalHeader().setDefaultSectionSize(theme.ROW_HEIGHT)
+        self.view.verticalHeader().setDefaultSectionSize(T.ROW_HEIGHT)
         header = self.view.horizontalHeader()
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         header.setHighlightSections(False)
+        header.setTextElideMode(Qt.ElideRight)
         header.setMinimumSectionSize(NAME_COLUMN_FLOOR // 2)
         header.sectionDoubleClicked.connect(self._cycle_sort)
 
-        self._empty = EmptyState(empty_text)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._empty = ly.empty_state(empty_text)
+        self._layout = ly.vbox(self)
         self._layout.addWidget(self.view)
         self._layout.addWidget(self._empty)
         self.view.hide()
@@ -820,12 +790,21 @@ class DataTable(QWidget):
         self._proxy.sort(column, order)
 
     def _size_columns(self) -> None:
+        """A name may give way; a value or a unit may not.
+
+        The table is left Interactive throughout, which is the one arrangement
+        ``resizeColumnsToContents`` does not fight: called against explicit
+        resize modes it overrides them and collapses whatever was fixed.
+        """
         header = self.view.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
         self.view.resizeColumnsToContents()
         for index in range(self._model.columnCount()):
             if index == 0:
                 width = min(max(self.view.columnWidth(0), NAME_COLUMN_FLOOR), NAME_COLUMN_CEILING)
                 self.view.setColumnWidth(0, width)
             else:
-                self.view.setColumnWidth(index, max(self.view.columnWidth(index), 88))
+                self.view.setColumnWidth(
+                    index, max(self.view.columnWidth(index), VALUE_COLUMN_FLOOR)
+                )
         header.setStretchLastSection(True)

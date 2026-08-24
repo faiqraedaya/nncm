@@ -14,18 +14,17 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QDialogButtonBox,
     QFrame,
-    QHBoxLayout,
-    QLabel,
     QLineEdit,
-    QPushButton,
     QScrollArea,
-    QVBoxLayout,
     QWidget,
 )
 
-from .. import theme
+from .. import theme as T
 from ..config import Material, Range, format_composition, parse_composition
+from . import layout as ly
+from .theme import restyle
 from .widgets import Card, Explanation, Form, RangeField, choice_field, decimal_field
 
 PROPERTY_FIELDS = [
@@ -40,10 +39,7 @@ class Section(Card):
     """A titled card in a dialog's scrolling column, with an optional blurb."""
 
     def __init__(self, title: str, blurb: str = "", parent: QWidget | None = None):
-        super().__init__(parent=parent)
-        heading = QLabel(title)
-        heading.setObjectName("SectionTitle")
-        self.body().insertWidget(0, heading)
+        super().__init__(title, parent=parent)
         if blurb:
             self.body().insertWidget(1, Explanation(blurb))
         self.form = Form()
@@ -55,19 +51,21 @@ class MaterialDialog(QDialog):
     def __init__(self, material: Material, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Material — {material.name}" if material.name else "Material")
+        # Derived from the content: the Composition field holds a component
+        # list ("METHANE 90, ETHANE 7, PROPANE 3") that must stay readable, and
+        # the four Conditions rows put two value fields and a checkbox on one
+        # line. Narrower than this and one of them starts clipping.
         self.setMinimumWidth(560)
         self.resize(620, 760)
         self._material = material
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+        outer = ly.window_layout(self)
+        outer.setSpacing(T.SPACING_ROW)
 
         column = QWidget()
         column.setObjectName("Body")
-        stack = QVBoxLayout(column)
-        stack.setContentsMargins(0, 0, 12, 0)
-        stack.setSpacing(12)
+        stack = ly.vbox(column, spacing=T.SPACING_GROUP)
+        stack.setContentsMargins(0, 0, T.SPACING_ROW, 0)
 
         # -- identity -----------------------------------------------------
         identity = Section(
@@ -142,28 +140,24 @@ class MaterialDialog(QDialog):
         outer.addWidget(scroll, 1)
 
         # -- footer -------------------------------------------------------
-        self._problem = QLabel("")
-        self._problem.setObjectName("Danger")
-        self._problem.setWordWrap(True)
-        self._problem.setStyleSheet(
-            f"border: 1px solid {theme.DANGER}; border-radius: {theme.RADIUS_CONTROL}px;"
-            f" padding: 8px 10px; color: {theme.DANGER};"
-        )
-        self._problem.hide()
+        # The first problem is reported here, above the buttons: bad input
+        # never closes the dialog and never opens a second window to complain
+        # about the first.
+        self._problem = ly.status_label()
         outer.addWidget(self._problem)
 
-        footer = QHBoxLayout()
-        footer.setSpacing(8)
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        save = QPushButton("Save")  # the verb, not "OK"
-        save.setProperty("primary", "true")
-        save.clicked.connect(self._save)
+        # A button box, so the buttons arrive in the host platform's own order.
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        save = self._buttons.button(QDialogButtonBox.Save)
+        save.setText("Save this material")  # the verb, not "OK"
+        save.setProperty("variant", "primary")
         save.setDefault(True)
-        footer.addStretch(1)
-        footer.addWidget(cancel)
-        footer.addWidget(save)
-        outer.addLayout(footer)
+        restyle(save)
+        self._buttons.accepted.connect(self._save)
+        self._buttons.rejected.connect(self.reject)
+        outer.addWidget(self._buttons)
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -176,12 +170,11 @@ class MaterialDialog(QDialog):
             field.set_values(value.min, value.max, value.log)
 
     def _fail(self, message: str) -> None:
-        self._problem.setText(message)
-        self._problem.show()
+        ly.set_status(self._problem, message, "error")
 
     # -- result ------------------------------------------------------------
     def _save(self) -> None:
-        self._problem.hide()
+        ly.set_status(self._problem, "")
         name = self.name.text().strip()
         if not name:
             self._fail("Material needs a name — it is how Phast and the case table refer to it.")

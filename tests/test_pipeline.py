@@ -12,7 +12,15 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nncm.config import Material, NncmConfig, Project, Range, SamplingConfig
+from nncm.config import (
+    Material,
+    NncmConfig,
+    PhastConfig,
+    Project,
+    Range,
+    SamplingConfig,
+    shipped_template,
+)
 from nncm.features import FeatureSpec, build_features, domain_report, fit_feature_spec
 from nncm.phast import units
 from nncm.phast.output_reader import normalise_path, parse_weather, scenario_key
@@ -26,6 +34,65 @@ requires_template = pytest.mark.skipif(not TEMPLATE.exists(), reason="Safeti tem
 requires_output = pytest.mark.skipif(
     not EXAMPLE_OUTPUT.exists(), reason="example Safeti output not present"
 )
+
+
+# ---------------------------------------------------------------------------
+# The template path
+#
+# Versions up to 4 wrote the shipped template's absolute path into every
+# project. That path is only true for the directory it was computed in, so
+# moving the checkout left saved projects pointing at a file that had never
+# been theirs to name, and the export died several frames down with a bare
+# missing-file message.
+# ---------------------------------------------------------------------------
+def test_a_new_project_does_not_store_a_path_to_theshipped_template():
+    config = NncmConfig()
+    assert config.phast.template == "", (
+        "an absolute path into the installation must never be persisted"
+    )
+    assert config.phast.template_path() == shipped_template()
+
+
+def test_a_staleshipped_template_path_is_repaired_on_load():
+    """The exact failure: a project written before the checkout moved."""
+    stale = {
+        "version": 4,
+        "phast": {"template": r"C:\Dev\nncm\templates\Safeti Template Input Sheet.xlsx"},
+    }
+    config = NncmConfig.from_dict(stale)
+    assert config.phast.template == ""
+    assert config.phast.template_path() == shipped_template()
+    assert config.migrated, "the repaired config must be written back to disk"
+
+
+def test_a_custom_template_is_never_swapped_out_from_under_the_user(tmp_path):
+    """A workbook the user chose is theirs, present or missing.
+
+    Silently substituting the shipped template would change what gets
+    exported without saying so.
+    """
+    missing = tmp_path / "My Own Study.xlsx"
+    config = NncmConfig.from_dict({"version": 4, "phast": {"template": str(missing)}})
+    assert config.phast.template == str(missing)
+    assert config.phast.template_path() == missing
+
+    # Same filename as the shipped one, but a real file elsewhere: still theirs.
+    mine = tmp_path / TEMPLATE.name
+    mine.write_bytes(b"not really a workbook")
+    kept = NncmConfig.from_dict({"version": 4, "phast": {"template": str(mine)}})
+    assert kept.phast.template == str(mine)
+
+
+def test_a_missing_template_names_the_setting_to_change(tmp_path):
+    from nncm.phast.input_writer import write_input_workbook
+
+    config = PhastConfig(template=str(tmp_path / "gone.xlsx"))
+    cases = pd.DataFrame({"vessel_name": ["PV0001"], "material": ["METHANE"]})
+    with pytest.raises(FileNotFoundError) as failure:
+        write_input_workbook(cases, tmp_path / "out.xlsx", config)
+    message = str(failure.value)
+    assert "gone.xlsx" in message
+    assert "nncm.json" in message, "the message must say what the user can change"
 
 
 # ---------------------------------------------------------------------------
