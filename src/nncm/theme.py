@@ -179,19 +179,6 @@ typeface either way, so the figure still matches the window."""
 
 FONT_MONO_STACK = ("Cascadia Mono", "Consolas", "SF Mono", "monospace")
 
-FONT_DISPLAY_FAMILY = "Newsreader"
-FONT_DISPLAY_STACK = (FONT_DISPLAY_FAMILY, "Newsreader Medium", "Georgia", "serif")
-"""For titles and headings only: page titles, card headings, the brand and chart
-titles. Everything a user reads to work — labels, values, tables — stays in
-Inter. The bundled face is a static Medium instance of the variable font at a
-16 pt optical size, cut so that Qt and matplotlib get the same glyphs (neither
-handles the optical-size axis reliably). Windows registers it under its legacy
-name, ``Newsreader Medium``, hence both entries."""
-MPL_DISPLAY_STACK = (FONT_DISPLAY_FAMILY, "serif")
-"""For matplotlib, which logs a warning for every absent family in a stack; the
-bundled face is always registered, so no platform names are needed."""
-WEIGHT_DISPLAY = 500
-
 # Sizes in px. Qt scales px with DPI; pt diverges across platforms.
 FONT_TITLE = 22           # the name of the current page. One per screen.
 FONT_HEADING = 16         # section heading inside a page; the brand in the rail
@@ -318,7 +305,7 @@ def matplotlib_rc() -> dict[str, Any]:
         "axes.axisbelow": True,
         "axes.labelsize": pt(FONT_CAPTION),
         "axes.titlesize": pt(FONT_LABEL),
-        "axes.titleweight": "medium",
+        "axes.titleweight": "semibold",
         "axes.titlelocation": "left",
         "axes.titlepad": 8,
         "axes.spines.top": False,
@@ -379,13 +366,6 @@ def style_axes(ax, grid: str = "both", zero_line: bool = False) -> None:
     ``grid`` is "both", "x", "y" or "none" — a chart that direct-labels every
     mark does not also need an axis repeating the same figures.
     """
-    # Panel titles are headings, so they take the display face. Titles are
-    # placed left (``axes.titlelocation``), which is its own text object, so
-    # each location is restyled rather than only ``ax.title``.
-    for loc in ("left", "center", "right"):
-        text = ax.get_title(loc=loc)
-        if text:
-            ax.set_title(text, loc=loc, fontfamily=list(MPL_DISPLAY_STACK))
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
@@ -470,8 +450,8 @@ def figure_header(fig, title: str, caveats: "str | list[str]", *, inline: bool =
 
     line = (caption_px + 4) / height          # one caveat line, in figure units
     top = 1.0 - 10.0 / height                 # a little air above the title
-    fig.text(0.006, top, title, ha="left", va="top", fontfamily=list(MPL_DISPLAY_STACK),
-             fontsize=pt(title_px), fontweight="medium", color=ink_hex(INK_PRIMARY))
+    fig.text(0.006, top, title, ha="left", va="top",
+             fontsize=pt(title_px), fontweight="semibold", color=ink_hex(INK_PRIMARY))
     body = top - (title_px + 8) / height
     if lines:
         fig.text(0.006, body, "\n".join(lines), ha="left", va="top",

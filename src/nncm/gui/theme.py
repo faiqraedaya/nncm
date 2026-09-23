@@ -117,7 +117,6 @@ def stylesheet() -> str:
     """
     ink = T.ink
     family = ", ".join(f'"{name}"' for name in T.FONT_STACK[:-1]) + ", sans-serif"
-    display = ", ".join(f'"{name}"' for name in T.FONT_DISPLAY_STACK[:-1]) + ", serif"
     grab = (T.SPLITTER_GRAB - T.SPLITTER_VISUAL) // 2
 
     return f"""
@@ -136,10 +135,10 @@ QScrollArea > QWidget > QWidget {{ background: transparent; }}
 /* -- Type -------------------------------------------------------------- */
 QLabel {{ background: transparent; border: none; padding: 0px; }}
 QLabel[role="title"] {{
-    font-family: {display}; font-size: {T.FONT_TITLE}px; font-weight: {T.WEIGHT_DISPLAY};
+    font-size: {T.FONT_TITLE}px; font-weight: {T.WEIGHT_SEMIBOLD};
 }}
 QLabel[role="heading"], QLabel[role="brand"] {{
-    font-family: {display}; font-size: {T.FONT_HEADING}px; font-weight: {T.WEIGHT_DISPLAY};
+    font-size: {T.FONT_HEADING}px; font-weight: {T.WEIGHT_SEMIBOLD};
 }}
 QLabel[role="caption"] {{
     font-size: {T.FONT_CAPTION}px; font-weight: {T.WEIGHT_MEDIUM};
