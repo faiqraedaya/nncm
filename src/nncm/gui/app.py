@@ -396,8 +396,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About NNCM",
-            f"<p style='font-family:\"{T.FONT_DISPLAY_FAMILY}\"; font-size:{T.FONT_HEADING}px; "
-            f"font-weight:{T.WEIGHT_DISPLAY};'>NNCM</p>"
+            f"<p style='font-size:{T.FONT_HEADING}px; font-weight:600;'>NNCM</p>"
             "<p>Neural network consequence modelling. Samples release scenarios, "
             "drives them through Phast or Safeti, and trains a surrogate model "
             "that predicts consequence results in milliseconds rather than "
