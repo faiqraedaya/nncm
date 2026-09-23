@@ -99,12 +99,12 @@ def write_input_workbook(
             f"The Safeti template was not found at {template_path}. "
             + (
                 'This project names its own template — set "template" in '
-                "nncm.json to a workbook that exists, or clear it to fall "
-                "back to the one that ships with NNCM."
+                "nncm.json to a workbook that exists, or clear it to use the "
+                "default location."
                 if custom
-                else "The template that ships with NNCM is missing from its "
-                "installation; reinstall it, or point the project at a copy "
-                'by setting "template" in nncm.json.'
+                else "The template is a client workbook and is not distributed "
+                f"with NNCM: copy it to {template_path}, or point the project "
+                'at one by setting "template" in nncm.json.'
             )
         )
     output_path = Path(output_path)

@@ -21,6 +21,9 @@ cd nncm
 uv sync
 ```
 
+The Safeti input template is a client workbook and is not in the repository. Copy it to
+`templates/Safeti Template Input Sheet.xlsx`, or set `phast.template` in a project's `nncm.json`.
+
 ## Use it
 
 ```bash
@@ -43,19 +46,24 @@ uv run nncm export                      # Phast input workbook -> phast/input/*.
 uv run nncm import path/to/results.xlsx # training data        -> datasets/training_data.csv
 uv run nncm train                       # trained model        -> models/run_<stamp>/
 uv run nncm predict --temperature 25 --pressure 60 --orifice 25 --material METHANE --mc 50
+uv run nncm predict --csv inputs.csv     # adds predictions and a domain_warnings column
 ```
 
-Every command takes `--project/-p <dir>`; the default is `./workspace`.
+Every command takes `--project/-p <dir>`; the default is `./workspace` in the current directory.
+
+A material named at prediction time gets the property descriptors the model was trained with. A
+material the model has not seen needs its descriptors as `mat_*` columns, or the prediction is
+refused rather than answered for an average fluid.
 
 ## What each stage does
 
 | Stage | What it does |
 | --- | --- |
-| **sample** | Builds the design of experiments — Latin Hypercube over temperature, pressure and hole size, inside each material's own envelope. |
+| **sample** | Builds the design of experiments — a Latin hypercube per material over temperature and pressure inside its own envelope, with stratified hole sizes. Vessel names carry a design ID, so two designs never collide. |
 | **export** | Writes the cases into a copy of the Safeti template, as a workbook Phast will import. |
 | **import** | Reads the Phast results workbook, joins it back onto the cases, and reports the scenarios that failed to converge instead of scoring them as zero. |
 | **train** | Fits one network across all materials and consequences, split by vessel so the score measures generalisation to new equipment. |
-| **predict** | Answers a single point or a CSV, with optional uncertainty, and flags inputs outside the training envelope. |
+| **predict** | Answers a single point or a CSV, with optional uncertainty, and flags inputs outside the training envelope of the named material, and settings the model never saw vary. |
 
 Four consequences are trained by default — release rate, velocity, distance to LFL and flame
 length. Around twenty are extracted from the results workbook, so others can be trained by naming
@@ -96,6 +104,8 @@ modelling.
 ```bash
 uv run --with pytest python -m pytest tests -q
 ```
+
+The workbook tests skip unless the template is present.
 
 ## How it works
 

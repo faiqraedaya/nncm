@@ -95,6 +95,9 @@ def run_phast_import(
     if cases is None:
         emit("! no case table found — falling back to the inputs echoed in the result sheets")
     frame, report = build_training_table(Path(output_workbook), cases, project.config.extraction)
+    filled = _attach_material_properties(frame, project.config.sampling.materials)
+    if filled:
+        emit(f"material descriptors taken from the catalogue for {filled} rows the case table did not cover")
 
     if append and project.training_data_path.exists():
         existing = pd.read_csv(project.training_data_path)
@@ -109,6 +112,31 @@ def run_phast_import(
     emit(report.summary())
     emit(f"training data written to {project.training_data_path}")
     return frame, report
+
+
+def _attach_material_properties(frame: pd.DataFrame, materials) -> int:
+    """Fill ``mat_*`` descriptors from the catalogue where the case join left none.
+
+    Without this, rows from results the case table does not cover carry no
+    descriptors and training imputes the median fluid for them. Returns the
+    number of rows filled.
+    """
+    if "material" not in frame.columns or frame.empty:
+        return 0
+    catalogue = {m.name.strip().casefold(): m.properties for m in materials if m.properties}
+    names = sorted({k for props in catalogue.values() for k in props})
+    columns = [f"mat_{k}" for k in names]
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = float("nan")
+    if not columns:
+        return 0
+    lacking = frame[columns].isna().all(axis=1)
+    keys = frame["material"].astype(str).str.strip().str.casefold()
+    known = lacking & keys.isin(catalogue)
+    for name, column in zip(names, columns):
+        frame.loc[known, column] = keys[known].map(lambda k, n=name: catalogue[k].get(n, float("nan")))
+    return int(known.sum())
 
 
 @dataclass

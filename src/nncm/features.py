@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any  # noqa: F401  (used in annotations below)
+from numbers import Real
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,14 @@ ATMOSPHERIC_PRESSURE_BARA = 1.01325
 BASE_INPUTS = ["temperature_degC", "pressure_barg", "orifice_mm"]
 WEATHER_INPUTS = ["wind_speed_ms", "stability_index"]
 PROPERTY_PREFIX = "mat_"
+
+# Inputs the design may or may not vary. A varied one becomes a feature; a
+# constant one is recorded as a fixed setting the model is only valid for.
+OPTIONAL_INPUTS = {"elevation_m": "elevation_m", "mass_inventory_kg": "log_inventory"}
+
+# Fallback log offset for a target with none configured, as a fraction of the
+# median positive training value.
+DEFAULT_OFFSET_FRACTION = 1e-3
 
 
 @dataclass
@@ -42,13 +51,27 @@ class FeatureSpec:
     input_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
     """Observed range of every raw input; inference flags out-of-domain queries
     instead of silently extrapolating."""
+    material_bounds: dict[str, dict[str, tuple[float, float]]] = field(default_factory=dict)
+    """Observed range of the base inputs per material. Each material is sampled
+    inside its own envelope, so a point inside the global range can still be
+    far outside anything the model saw for that fluid."""
+    material_properties: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    """Descriptor values each training material carried. Prediction looks them
+    up by name, so a query naming a material gets the properties the model was
+    trained with, not the current config's or the training median."""
+    variable_inputs: list[str] = field(default_factory=list)
+    fixed_inputs: dict[str, float] = field(default_factory=dict)
+    """Inputs held constant across the training data. The model says nothing
+    about any other value of them."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FeatureSpec":
-        bounds = {k: tuple(v) for k, v in (data.get("input_bounds") or {}).items()}
+        def bounds(raw: dict[str, Any] | None) -> dict[str, tuple[float, float]]:
+            return {k: (float(v[0]), float(v[1])) for k, v in (raw or {}).items()}
+
         return cls(
             feature_columns=list(data.get("feature_columns", [])),
             property_columns=list(data.get("property_columns", [])),
@@ -56,7 +79,15 @@ class FeatureSpec:
             use_weather=bool(data.get("use_weather", True)),
             use_material_properties=bool(data.get("use_material_properties", True)),
             medians={k: float(v) for k, v in (data.get("medians") or {}).items()},
-            input_bounds=bounds,
+            input_bounds=bounds(data.get("input_bounds")),
+            material_bounds={
+                m: bounds(b) for m, b in (data.get("material_bounds") or {}).items()
+            },
+            material_properties={
+                m: dict(p) for m, p in (data.get("material_properties") or {}).items()
+            },
+            variable_inputs=list(data.get("variable_inputs", [])),
+            fixed_inputs={k: float(v) for k, v in (data.get("fixed_inputs") or {}).items()},
         )
 
 
@@ -81,11 +112,24 @@ def fit_feature_spec(
 
     has_weather = use_weather and all(c in frame.columns for c in WEATHER_INPUTS)
 
+    variable_inputs: list[str] = []
+    fixed_inputs: dict[str, float] = {}
+    for column in OPTIONAL_INPUTS:
+        if column not in frame.columns or not frame[column].notna().any():
+            continue
+        values = frame[column].dropna().astype(float)
+        if values.nunique() > 1:
+            variable_inputs.append(column)
+        else:
+            fixed_inputs[column] = float(values.iloc[0])
+
     spec = FeatureSpec(
         property_columns=property_columns,
         material_categories=material_categories,
         use_weather=has_weather,
         use_material_properties=bool(property_columns),
+        variable_inputs=variable_inputs,
+        fixed_inputs=fixed_inputs,
     )
 
     built = _build(frame, spec, impute=False)
@@ -96,18 +140,80 @@ def fit_feature_spec(
         else 0.0
         for column in built.columns
     }
-    raw_inputs = BASE_INPUTS + ([*WEATHER_INPUTS] if has_weather else [])
-    spec.input_bounds = {
+    raw_inputs = (
+        BASE_INPUTS
+        + ([*WEATHER_INPUTS] if has_weather else [])
+        + variable_inputs
+        + property_columns
+    )
+    spec.input_bounds = _bounds(frame, raw_inputs)
+
+    if "material" in frame.columns:
+        materials = frame.dropna(subset=["material"])
+        for name, group in materials.groupby(materials["material"].astype(str)):
+            spec.material_bounds[name] = _bounds(group, BASE_INPUTS)
+            if property_columns:
+                first = group[property_columns].iloc[0]
+                spec.material_properties[name] = {
+                    column: (float(first[column]) if pd.notna(first[column]) else None)
+                    for column in property_columns
+                }
+    return spec
+
+
+def _bounds(frame: pd.DataFrame, columns: list[str]) -> dict[str, tuple[float, float]]:
+    return {
         column: (float(frame[column].min()), float(frame[column].max()))
-        for column in raw_inputs
+        for column in columns
         if column in frame.columns and frame[column].notna().any()
     }
-    return spec
+
+
+def resolve_materials(frame: pd.DataFrame, spec: FeatureSpec, strict: bool = False) -> pd.DataFrame:
+    """Fill each row's material descriptors from the table saved with the model.
+
+    Values given explicitly in ``frame`` win; the table fills the gaps. With
+    ``strict``, a row the model cannot place — no descriptors and a material it
+    never saw — raises instead of being imputed with training medians, which
+    would silently answer for an average fluid rather than the one named.
+    """
+    if not spec.property_columns:
+        return frame
+    frame = frame.copy()
+    for column in spec.property_columns:
+        if column not in frame.columns:
+            frame[column] = np.nan
+    if "material" in frame.columns and spec.material_properties:
+        names = frame["material"].astype(str).str.strip()
+        for column in spec.property_columns:
+            lookup = names.map(
+                lambda name, c=column: (spec.material_properties.get(name) or {}).get(c)
+            )
+            frame[column] = frame[column].astype(float).fillna(lookup.astype(float))
+
+    if strict:
+        known = set(spec.material_properties)
+        named = (
+            frame["material"].astype(str).str.strip()
+            if "material" in frame.columns
+            else pd.Series("", index=frame.index)
+        )
+        no_properties = frame[spec.property_columns].isna().all(axis=1)
+        unplaced = no_properties & ~named.isin(known)
+        if unplaced.any():
+            offenders = sorted(set(named[unplaced].replace({"nan": "", "None": ""})))
+            listed = ", ".join(repr(n) for n in offenders if n) or "no material given"
+            raise ValueError(
+                f"cannot place {int(unplaced.sum())} row(s) ({listed}): the model needs "
+                f"either a material it was trained on ({', '.join(sorted(known)) or 'none recorded'}) "
+                f"or the descriptors {', '.join(spec.property_columns)} as columns"
+            )
+    return frame
 
 
 def build_features(frame: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     """Build the feature matrix for ``frame`` exactly as fitted."""
-    built = _build(frame, spec, impute=True)
+    built = _build(resolve_materials(frame, spec), spec, impute=True)
     for column in spec.feature_columns:
         if column not in built.columns:
             built[column] = spec.medians.get(column, 0.0)
@@ -175,6 +281,16 @@ def _build(frame: pd.DataFrame, spec: FeatureSpec, impute: bool) -> pd.DataFrame
         for category in spec.material_categories:
             columns[f"material_is_{_slug(category)}"] = (material == category).astype(float)
 
+    for column in spec.variable_inputs:
+        values = (
+            frame[column].to_numpy(dtype=float)
+            if column in frame.columns
+            else np.full(len(frame), np.nan)
+        )
+        if OPTIONAL_INPUTS[column].startswith("log_"):
+            values = np.log10(np.clip(values, 1e-6, None))
+        columns[OPTIONAL_INPUTS[column]] = values
+
     if spec.use_weather:
         wind = (
             frame["wind_speed_ms"].to_numpy(dtype=float)
@@ -207,30 +323,99 @@ def _slug(text: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in str(text)).strip("_").lower()
 
 
+def _number(value: Any) -> float | None:
+    """A finite real number, or None. Accepts NumPy scalars, which pandas rows carry."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _check_range(flags: dict[str, str], column: str, value: float, low: float, high: float, where: str) -> None:
+    if value < low:
+        flags[column] = f"{value:.4g} below {where} ({low:.4g} .. {high:.4g})"
+    elif value > high:
+        flags[column] = f"{value:.4g} above {where} ({low:.4g} .. {high:.4g})"
+
+
 def domain_report(row: dict[str, Any], spec: FeatureSpec) -> dict[str, str]:
     """Flag inputs outside the training envelope (predictions there are guesses)."""
     flags: dict[str, str] = {}
+    material = row.get("material")
+    material = "" if material is None or (isinstance(material, float) and math.isnan(material)) else str(material).strip()
+
+    envelope = spec.material_bounds.get(material, {})
     for column, (low, high) in spec.input_bounds.items():
-        value = row.get(column)
-        if not isinstance(value, (int, float)) or (isinstance(value, float) and math.isnan(value)):
+        value = _number(row.get(column))
+        if value is None:
             continue
-        if value < low:
-            flags[column] = f"{value:.4g} below training range ({low:.4g} .. {high:.4g})"
-        elif value > high:
-            flags[column] = f"{value:.4g} above training range ({low:.4g} .. {high:.4g})"
+        _check_range(flags, column, value, low, high, "training range")
+        if column not in flags and column in envelope:
+            low_m, high_m = envelope[column]
+            _check_range(flags, column, value, low_m, high_m, f"the range trained for {material}")
+
+    for column, fixed in spec.fixed_inputs.items():
+        value = _number(row.get(column))
+        if value is not None and not math.isclose(value, fixed, rel_tol=1e-6, abs_tol=1e-9):
+            flags[column] = (
+                f"{value:.4g} given, but every training case used {fixed:.4g} — "
+                "the model does not respond to this input"
+            )
 
     # A one-hot model has no representation for an unseen material: every
     # indicator is zero, which is a point the network was never trained on.
     if spec.material_categories:
-        material = row.get("material")
-        if material is None or str(material).strip() == "":
+        if not material:
             flags["material"] = (
                 "no material given — the model was trained per material, so this "
                 "prediction sits outside its inputs"
             )
-        elif str(material) not in spec.material_categories:
+        elif material not in spec.material_categories:
             flags["material"] = (
                 f"'{material}' was not in the training set "
                 f"({len(spec.material_categories)} known materials)"
             )
+    elif spec.property_columns and material and material not in spec.material_properties:
+        flags["material"] = (
+            f"'{material}' was not in the training set; predicted from its descriptors alone"
+        )
     return flags
+
+
+def domain_flags(frame: pd.DataFrame, spec: FeatureSpec) -> pd.Series:
+    """:func:`domain_report` for every row, joined into one readable string per row."""
+    resolved = resolve_materials(frame, spec)
+    return pd.Series(
+        [
+            "; ".join(f"{column}: {message}" for column, message in domain_report(row, spec).items())
+            for row in resolved.to_dict("records")
+        ],
+        index=frame.index,
+        dtype=object,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Target transform
+# ---------------------------------------------------------------------------
+def fit_log_offset(values: np.ndarray, configured: float | None) -> float:
+    """The offset ``c`` in ``log10(y + c)``.
+
+    ``log1p`` is linear below about 0.1, which erases the difference between a
+    1 mm and a 5 mm release. A plain log keeps every decade, and ``c`` sets the
+    smallest value worth resolving while keeping zeros finite. Configured per
+    target in physical units; otherwise a small fraction of the median.
+    """
+    if configured is not None and configured > 0:
+        return float(configured)
+    positive = values[np.isfinite(values) & (values > 0)]
+    return float(np.median(positive) * DEFAULT_OFFSET_FRACTION) if positive.size else 1e-6
+
+
+def to_log_space(values: np.ndarray, offset: float) -> np.ndarray:
+    """Log targets are physically non-negative; negatives are clipped to zero."""
+    return np.log10(np.clip(values, 0.0, None) + offset)
+
+
+def from_log_space(values: np.ndarray, offset: float) -> np.ndarray:
+    return np.maximum(10.0**values - offset, 0.0)

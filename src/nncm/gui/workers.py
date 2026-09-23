@@ -19,6 +19,7 @@ here invents a rate or animates over unknown work.
 
 from __future__ import annotations
 
+import threading
 import time
 import traceback
 from typing import Any, Callable
@@ -34,11 +35,18 @@ class Worker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, task: Callable[..., Any], pass_log: bool = True, pass_progress: bool = False):
+    def __init__(
+        self,
+        task: Callable[..., Any],
+        pass_log: bool = True,
+        pass_progress: bool = False,
+        should_stop: Callable[[], bool] | None = None,
+    ):
         super().__init__()
         self._task = task
         self._pass_log = pass_log
         self._pass_progress = pass_progress
+        self._should_stop = should_stop
 
     @Slot()
     def run(self) -> None:
@@ -47,12 +55,19 @@ class Worker(QObject):
             kwargs["log"] = self.log.emit
         if self._pass_progress:
             kwargs["progress"] = self.progress.emit
+        if self._should_stop is not None:
+            kwargs["should_stop"] = self._should_stop
         try:
             result = self._task(**kwargs)
         except Exception as exc:  # surfaced in the interface, never swallowed
             self.failed.emit(f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}")
-            return
-        self.finished.emit(result)
+        else:
+            self.finished.emit(result)
+        finally:
+            # End the thread's event loop as soon as the task returns, so the
+            # thread finishes on its own. Otherwise it waits for the UI thread
+            # to call quit(), and a UI thread blocked in wait() never does.
+            self.thread().quit()
 
 
 class TaskRunner(QObject):
@@ -67,10 +82,28 @@ class TaskRunner(QObject):
         self._on_done: Callable[[Any], None] | None = None
         self._on_error: Callable[[str], None] | None = None
         self._on_progress: Callable[[int, int], None] | None = None
+        self._stop = threading.Event()
+        self.cancellable = False
 
     @property
     def busy(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
+        # Busy until the result has been handled on the UI thread, not merely
+        # until the thread ends: a task started in between would be retired
+        # by its predecessor's result.
+        return self._thread is not None
+
+    def request_stop(self) -> bool:
+        """Ask a cancellable task to stop at its next check. False if it cannot."""
+        if not (self.busy and self.cancellable and self._thread.isRunning()):
+            return False
+        self._stop.set()
+        return True
+
+    def wait(self) -> None:
+        """Block until the running task returns. Used only when the window closes:
+        a QThread destroyed while running takes the process down with it."""
+        if self._thread is not None:
+            self._thread.wait()
 
     @property
     def elapsed_ms(self) -> int:
@@ -86,14 +119,24 @@ class TaskRunner(QObject):
         on_error: Callable[[str], None],
         on_progress: Callable[[int, int], None] | None = None,
         pass_log: bool = True,
+        cancellable: bool = False,
     ) -> bool:
+        """Start ``task``. A ``cancellable`` task is passed ``should_stop``, a
+        callable it polls and honours by returning early or raising."""
         if self.busy:
             return False
         self._on_log, self._on_done = on_log, on_done
         self._on_error, self._on_progress = on_error, on_progress
+        self._stop.clear()
+        self.cancellable = cancellable
 
         thread = QThread(self)
-        worker = Worker(task, pass_log=pass_log, pass_progress=on_progress is not None)
+        worker = Worker(
+            task,
+            pass_log=pass_log,
+            pass_progress=on_progress is not None,
+            should_stop=self._stop.is_set if cancellable else None,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 

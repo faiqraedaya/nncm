@@ -312,6 +312,13 @@ def build_training_table(
             )
             if config.drop_unmatched:
                 merged = merged[merged["leak_name"].notna()].reset_index(drop=True)
+    else:
+        report.warnings.append(
+            "no case table — inputs, material and vessel grouping come from the result sheets"
+        )
+    # Rows no case covered still need a grouping key and a material, or the
+    # split falls back to random rows and the material is lost.
+    _fill_from_results(merged)
 
     # Quality gates: Phast leaves cells blank for scenarios that did not run.
     before = len(merged)
@@ -323,7 +330,9 @@ def build_training_table(
     before = len(merged)
     for column in config.drop_nonpositive:
         if column in merged.columns:
-            merged = merged[merged[column] > 0]
+            # A missing value is not a non-positive one: a sparse target is
+            # masked in training, so its blank rows must survive this gate.
+            merged = merged[~(merged[column] <= 0)]
     report.dropped_nonpositive = before - len(merged)
 
     merged = merged.reset_index(drop=True)
@@ -372,7 +381,11 @@ def _join_cases(merged: pd.DataFrame, cases: pd.DataFrame) -> tuple[pd.DataFrame
             matched_by["none"] += 1
         attached.append(record)
 
-    case_frame = pd.DataFrame(attached, index=merged.index)
+    # Columns fixed up front, so a study with no match at all still yields
+    # the case columns (all empty) rather than none.
+    case_frame = pd.DataFrame(
+        attached, index=merged.index, columns=list(dict.fromkeys([*case_columns, "leak_name"]))
+    )
     for column in case_frame.columns:
         if column in {"temperature_degC", "pressure_barg", "orifice_mm"} and column in merged.columns:
             # Sampled values win; the echoed value stays as the fallback.
@@ -383,17 +396,33 @@ def _join_cases(merged: pd.DataFrame, cases: pd.DataFrame) -> tuple[pd.DataFrame
 
 
 def _fill_from_results(frame: pd.DataFrame) -> None:
-    """Backfill grouping key and material for rows the case join did not cover."""
-    parent_path = frame["path_key"].str.rsplit("\\", n=1).str[0]
+    """Backfill grouping key and material for rows the case join did not cover.
+
+    The grouping key exists to keep leaks sharing one vessel's state out of
+    both train and test, so the fallback groups on exactly that state —
+    material, temperature and pressure as Phast echoes them. The path cannot
+    be used: depending on the study layout it ends at the vessel or at the
+    leak, and its parent is the vessel or the whole study.
+    """
+    if frame.empty:
+        return
+    state_columns = [c for c in ("material_id", "temperature_degC", "pressure_barg") if c in frame.columns]
+    if state_columns:
+        fallback = frame[state_columns].astype(str).agg("|".join, axis=1)
+    else:
+        fallback = frame["path_key"]
+    fallback = "phast:" + fallback
     if "vessel_id" in frame.columns:
         frame["vessel_id"] = frame["vessel_id"].astype("object").where(
-            frame["vessel_id"].notna(), parent_path
+            frame["vessel_id"].notna(), fallback
         )
     else:
-        frame["vessel_id"] = parent_path
+        frame["vessel_id"] = fallback
 
     if "material_id" in frame.columns:
-        fallback = frame["material_id"].astype(str)
+        fallback = frame["material_id"].where(
+            frame["material_id"].isna(), frame["material_id"].astype(str).str.strip()
+        )
         if "material" in frame.columns:
             frame["material"] = frame["material"].astype("object").where(
                 frame["material"].notna(), fallback

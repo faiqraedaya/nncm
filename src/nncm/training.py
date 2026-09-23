@@ -14,7 +14,6 @@ Two things differ substantially from the original script:
 from __future__ import annotations
 
 import json
-import os
 import platform
 import random
 from dataclasses import dataclass, field
@@ -26,10 +25,15 @@ import numpy as np
 import pandas as pd
 
 from .config import Project, TrainingConfig
-from .features import FeatureSpec, build_features, fit_feature_spec
+from .features import build_features, fit_feature_spec, fit_log_offset, from_log_space, to_log_space
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
+StopFn = Callable[[], bool]
+
+
+class TrainingCancelled(RuntimeError):
+    """Raised when the caller asked training to stop. No run is saved."""
 
 
 @dataclass
@@ -63,9 +67,20 @@ class TrainingResult:
 
 
 def _seed_everything(seed: int) -> None:
-    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    """Seed Python, NumPy and TensorFlow, and ask TensorFlow for deterministic ops.
+
+    Setting ``PYTHONHASHSEED`` here would have no effect: it is read once at
+    interpreter start-up.
+    """
+    import tensorflow as tf
+
     random.seed(seed)
     np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:  # older TensorFlow, or already initialised: best effort
+        pass
 
 
 def _grouped_split(
@@ -84,8 +99,8 @@ def _grouped_split(
         )
     test_groups = set(unique[:n_test].tolist())
     valid_groups = set(unique[n_test : n_test + n_valid].tolist())
-    is_test = np.array([g in test_groups for g in groups])
-    is_valid = np.array([g in valid_groups for g in groups])
+    is_test = np.isin(groups, list(test_groups))
+    is_valid = np.isin(groups, list(valid_groups))
     is_train = ~(is_test | is_valid)
     return np.where(is_train)[0], np.where(is_valid)[0], np.where(is_test)[0]
 
@@ -148,8 +163,13 @@ def train_model(
     log: LogFn | None = None,
     run_id: str | None = None,
     progress: ProgressFn | None = None,
+    should_stop: StopFn | None = None,
 ) -> TrainingResult:
-    """Train on the project's dataset and save a self-contained run directory."""
+    """Train on the project's dataset and save a self-contained run directory.
+
+    ``should_stop`` is polled after every batch; when it returns True training
+    ends and :class:`TrainingCancelled` is raised without writing a run.
+    """
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from sklearn.preprocessing import StandardScaler
     import joblib
@@ -157,9 +177,9 @@ def train_model(
     from tensorflow.keras import Model, callbacks, layers
 
     config = config or project.config.training
+    validate_training_config(config)
     emit: LogFn = log or (lambda message: print(message))
     _seed_everything(config.seed)
-    tf.random.set_seed(config.seed)
 
     if frame is None:
         if not project.training_data_path.exists():
@@ -205,22 +225,17 @@ def train_model(
     log_targets = [t for t in config.log_targets if t in targets]
     mask = present.to_numpy(dtype=float)  # 1 where the target was computed
     y_transformed = y.copy()
-    shifts: dict[str, float] = {}
-    # A log-transformed target is non-negative by construction, so inverting the
-    # transform must not produce a negative rate or distance. Where a shift was
-    # needed the data did contain non-positive values, and the observed minimum
-    # is the honest floor.
-    floors: dict[str, float] = {}
+    # log10(y + c): every decade of a quantity spanning 1e-4 to 1e3 carries the
+    # same weight in the loss, down to the offset c.
+    log_offsets: dict[str, float] = {}
     for idx, target in enumerate(targets):
         if target in log_targets:
             column = y[:, idx]
-            shift = 0.0
-            minimum = np.nanmin(column)
-            if minimum <= 0:
-                shift = abs(minimum) + 1e-6
-            shifts[target] = shift
-            floors[target] = 0.0 if shift == 0.0 else float(minimum)
-            y_transformed[:, idx] = np.log1p(column + shift)
+            negative = int((column < 0).sum())
+            if negative:
+                emit(f"! {target}: {negative} negative values clipped to zero before the log transform")
+            log_offsets[target] = fit_log_offset(column, config.log_offsets.get(target))
+            y_transformed[:, idx] = to_log_space(column, log_offsets[target])
 
     group_column = config.group_column if config.group_column in usable.columns else None
     if group_column is None:
@@ -255,6 +270,15 @@ def train_model(
         loss={f"{t}_output": "mse" for t in targets},
         metrics={f"{t}_output": ["mae"] for t in targets},
     )
+
+    cancelled = False
+
+    class _Stop(callbacks.Callback):
+        def on_train_batch_end(self, batch, logs=None):
+            nonlocal cancelled
+            if should_stop is not None and should_stop():
+                cancelled = True
+                self.model.stop_training = True
 
     class _Progress(callbacks.Callback):
         """Reports epochs that have finished — never a rate, never a guess.
@@ -297,8 +321,12 @@ def train_model(
                 monitor="val_loss", factor=0.5, patience=config.patience_reduce_lr, min_lr=1e-7
             ),
             _Progress(),
+            _Stop(),
         ],
     )
+    if cancelled:
+        emit("training cancelled — no run saved")
+        raise TrainingCancelled("training was cancelled")
 
     # Single-output inference model so downstream code never has to reassemble
     # a list of heads.
@@ -312,10 +340,7 @@ def train_model(
         out = processed.copy()
         for idx, target in enumerate(targets):
             if target in log_targets:
-                out[:, idx] = np.maximum(
-                    np.expm1(processed[:, idx]) - shifts.get(target, 0.0),
-                    floors.get(target, 0.0),
-                )
+                out[:, idx] = from_log_space(processed[:, idx], log_offsets[target])
         return out
 
     y_pred = _to_original(prediction_model.predict(X_test, verbose=0))
@@ -327,12 +352,23 @@ def train_model(
         # Score each target only where Phast actually produced a value.
         finite = (mask_test[:, idx] > 0) & np.isfinite(true_col) & np.isfinite(pred_col)
         true_col, pred_col = true_col[finite], pred_col[finite]
-        denominator = np.maximum(np.abs(true_col), np.percentile(np.abs(true_col), 5) or 1e-6)
         if finite.sum() < 5:
             per_target[target] = {"n_test": int(finite.sum())}
             continue
+        denominator = np.maximum(np.abs(true_col), np.percentile(np.abs(true_col), 5) or 1e-6)
+        r2_linear = float(r2_score(true_col, pred_col))
+        # R2 in the space the target is modelled in. On raw values a few large
+        # releases dominate the sum of squares, so a model that gets small
+        # releases badly wrong can still score 0.9.
+        r2 = (
+            float(r2_score(to_log_space(true_col, log_offsets[target]),
+                           to_log_space(pred_col, log_offsets[target])))
+            if target in log_targets
+            else r2_linear
+        )
         per_target[target] = {
-            "r2": float(r2_score(true_col, pred_col)),
+            "r2": r2,
+            "r2_linear": r2_linear,
             "mae": float(mean_absolute_error(true_col, pred_col)),
             "rmse": float(np.sqrt(mean_squared_error(true_col, pred_col))),
             # Median APE, not mean: a handful of near-zero true values otherwise
@@ -379,9 +415,10 @@ def train_model(
                 "run_id": run_id,
                 "targets": targets,
                 "log_targets": log_targets,
-                "shifts": shifts,
-                "floors": floors,
+                "target_transform": "log10_offset",
+                "log_offsets": log_offsets,
                 "feature_spec": spec.to_dict(),
+                "study_settings": _study_settings(project, spec),
                 "training_config": {
                     k: v for k, v in config.__dict__.items() if not k.startswith("_")
                 },
@@ -413,6 +450,36 @@ def train_model(
     )
     emit(result.summary())
     return result
+
+
+def validate_training_config(config: TrainingConfig) -> None:
+    """Reject settings that would otherwise fail deep inside Keras."""
+    if not 0 < config.test_size < 1 or not 0 < config.valid_size < 1:
+        raise ValueError("test_size and valid_size must each be between 0 and 1 (exclusive)")
+    if config.test_size + config.valid_size >= 1:
+        raise ValueError("test_size + valid_size must leave rows to train on (sum < 1)")
+    if not 0 <= config.dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
+    if config.epochs < 1 or config.batch_size < 1:
+        raise ValueError("epochs and batch_size must be >= 1")
+    if not config.hidden_units or any(u < 1 for u in [*config.hidden_units, *config.head_units]):
+        raise ValueError("hidden_units must be non-empty and every layer width >= 1")
+
+
+def _study_settings(project: Project, spec) -> dict[str, Any]:
+    """What the model is conditional on but never saw vary.
+
+    The surrogate reproduces Phast only for the template's weather set,
+    parameter sets and these per-row settings; saying so in the run keeps the
+    limit attached to every prediction made from it.
+    """
+    phast = project.config.phast
+    return {
+        "template": phast.template_path().name,
+        "vessel_defaults": dict(phast.vessel_defaults),
+        "leak_defaults": dict(phast.leak_defaults),
+        "fixed_inputs": dict(spec.fixed_inputs),
+    }
 
 
 def plot_parity(run_dir: Path, out_path: Path | None = None):
@@ -486,8 +553,12 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
     for index in range(len(targets), rows * cols):
         axes[index // cols][index % cols].axis("off")
 
+    grouped = _grouped_run(run_dir)
     caveats = [
-        f"{len(predictions):,} held-out rows, on vessels the model never saw in training.",
+        f"{len(predictions):,} held-out rows, on vessels the model never saw in training."
+        if grouped
+        else f"{len(predictions):,} held-out rows, split at random — neighbours of these rows "
+        "were trained on, so the fit looks better than it is.",
         "Both axes are logarithmic; the line is where a prediction equals Phast.",
     ]
     if dropped:
@@ -506,6 +577,14 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=150)
     return fig
+
+
+def _grouped_run(run_dir: Path) -> bool:
+    try:
+        meta = json.loads((Path(run_dir) / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return bool(meta.get("metrics", {}).get("group_column"))
 
 
 def _r2(true: np.ndarray, predicted: np.ndarray) -> float:

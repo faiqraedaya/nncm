@@ -94,12 +94,16 @@ def cmd_predict(args: argparse.Namespace) -> int:
 
     if args.csv:
         frame = pd.read_csv(args.csv)
-        predictions = bundle.predict_frame(frame, mc_samples=args.mc)
+        result = bundle.predict_batch(frame, mc_samples=args.mc)
         out = Path(args.out) if args.out else Path(args.csv).with_name(
             Path(args.csv).stem + "_predictions.csv"
         )
-        pd.concat([frame, predictions], axis=1).to_csv(out, index=False)
+        result.to_csv(out, index=False)
         print(f"{len(frame)} rows predicted -> {out}")
+        flagged = int((result["domain_warnings"] != "").sum())
+        if flagged:
+            print(f"! {flagged} rows outside the training envelope — see domain_warnings", file=sys.stderr)
+        _print_validity(bundle)
         return 0
 
     if args.temperature is None or args.pressure is None or args.orifice is None:
@@ -114,6 +118,10 @@ def cmd_predict(args: argparse.Namespace) -> int:
     }
     if args.material:
         inputs["material"] = args.material
+    if args.elevation is not None:
+        inputs["elevation_m"] = args.elevation
+    if args.inventory is not None:
+        inputs["mass_inventory_kg"] = args.inventory
     prediction = bundle.predict_one(inputs, mc_samples=args.mc)
     for target, value in prediction.values.items():
         spread = prediction.uncertainty.get(target)
@@ -121,7 +129,14 @@ def cmd_predict(args: argparse.Namespace) -> int:
         print(f"{target:<28} {format_quantity(value)}{suffix}")
     for column, warning in prediction.domain_warnings.items():
         print(f"! {column}: {warning}", file=sys.stderr)
+    _print_validity(bundle)
     return 0
+
+
+def _print_validity(bundle) -> None:
+    note = bundle.validity_note()
+    if note:
+        print(note, file=sys.stderr)
 
 
 def cmd_info(args: argparse.Namespace) -> int:
@@ -185,7 +200,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, help="degC")
     p.add_argument("--pressure", type=float, help="barg")
     p.add_argument("--orifice", type=float, help="mm")
-    p.add_argument("--material")
+    p.add_argument("--material", help="material name as trained (its descriptors are looked up)")
+    p.add_argument("--elevation", type=float, help="release elevation, m")
+    p.add_argument("--inventory", type=float, help="mass inventory, kg")
     p.add_argument("--wind", type=float, default=5.0, help="wind speed m/s")
     p.add_argument("--stability", type=float, default=4.0, help="Pasquill index (A=1 .. F=6)")
     p.add_argument("--csv", help="predict for every row of a CSV instead")

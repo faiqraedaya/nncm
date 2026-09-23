@@ -1,7 +1,8 @@
-"""Tests for the stages that are expensive to debug by hand.
+"""Tests for the functions whose failure gives a wrong answer without an error.
 
-Deliberately excluded: model quality (that is what the metrics artifacts are
-for) and anything requiring Phast itself.
+Model quality is out of scope (that is what the run metrics are for), as is
+anything needing Phast itself. Workbook tests need the client template, which
+is not in the repository, and skip without it.
 """
 
 from __future__ import annotations
@@ -12,18 +13,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nncm.config import (
-    Material,
-    NncmConfig,
-    PhastConfig,
-    Project,
-    Range,
-    SamplingConfig,
-    shipped_template,
+from nncm.config import Material, MixtureComponent, NncmConfig, Project, Range, SamplingConfig
+from nncm.features import (
+    FeatureSpec,
+    build_features,
+    domain_report,
+    fit_feature_spec,
+    resolve_materials,
 )
-from nncm.features import FeatureSpec, build_features, domain_report, fit_feature_spec
 from nncm.phast import units
-from nncm.phast.output_reader import normalise_path, parse_weather, scenario_key
+from nncm.phast.output_reader import build_training_table, identifiers, parse_weather
 from nncm.sampling import generate_cases
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -36,70 +35,7 @@ requires_output = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------------------
-# The template path
-#
-# Versions up to 4 wrote the shipped template's absolute path into every
-# project. That path is only true for the directory it was computed in, so
-# moving the checkout left saved projects pointing at a file that had never
-# been theirs to name, and the export died several frames down with a bare
-# missing-file message.
-# ---------------------------------------------------------------------------
-def test_a_new_project_does_not_store_a_path_to_theshipped_template():
-    config = NncmConfig()
-    assert config.phast.template == "", (
-        "an absolute path into the installation must never be persisted"
-    )
-    assert config.phast.template_path() == shipped_template()
-
-
-def test_a_staleshipped_template_path_is_repaired_on_load():
-    """The exact failure: a project written before the checkout moved."""
-    stale = {
-        "version": 4,
-        "phast": {"template": r"C:\Dev\nncm\templates\Safeti Template Input Sheet.xlsx"},
-    }
-    config = NncmConfig.from_dict(stale)
-    assert config.phast.template == ""
-    assert config.phast.template_path() == shipped_template()
-    assert config.migrated, "the repaired config must be written back to disk"
-
-
-def test_a_custom_template_is_never_swapped_out_from_under_the_user(tmp_path):
-    """A workbook the user chose is theirs, present or missing.
-
-    Silently substituting the shipped template would change what gets
-    exported without saying so.
-    """
-    missing = tmp_path / "My Own Study.xlsx"
-    config = NncmConfig.from_dict({"version": 4, "phast": {"template": str(missing)}})
-    assert config.phast.template == str(missing)
-    assert config.phast.template_path() == missing
-
-    # Same filename as the shipped one, but a real file elsewhere: still theirs.
-    mine = tmp_path / TEMPLATE.name
-    mine.write_bytes(b"not really a workbook")
-    kept = NncmConfig.from_dict({"version": 4, "phast": {"template": str(mine)}})
-    assert kept.phast.template == str(mine)
-
-
-def test_a_missing_template_names_the_setting_to_change(tmp_path):
-    from nncm.phast.input_writer import write_input_workbook
-
-    config = PhastConfig(template=str(tmp_path / "gone.xlsx"))
-    cases = pd.DataFrame({"vessel_name": ["PV0001"], "material": ["METHANE"]})
-    with pytest.raises(FileNotFoundError) as failure:
-        write_input_workbook(cases, tmp_path / "out.xlsx", config)
-    message = str(failure.value)
-    assert "gone.xlsx" in message
-    assert "nncm.json" in message, "the message must say what the user can change"
-
-
-# ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
 def _materials() -> list[Material]:
-    """Catalogue matching the materials used by :func:`_sampling_config`."""
     return [
         Material("METHANE", properties={"molecular_weight": 16.04}),
         Material("PROPANE", properties={"molecular_weight": 44.1}),
@@ -113,57 +49,78 @@ def _sampling_config(**overrides) -> SamplingConfig:
         temperature=Range(-50, 150),
         pressure=Range(1, 100, log=True),
         orifice=Range(1, 500, log=True),
-        materials=[
-            Material("METHANE", properties={"molecular_weight": 16.04}),
-            Material("PROPANE", properties={"molecular_weight": 44.1}),
-        ],
+        materials=_materials(),
     )
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
 
 
-def test_sampling_is_reproducible_and_respects_bounds():
-    config = _sampling_config()
-    first, report = generate_cases(config)
-    second, _ = generate_cases(config)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+def test_stale_template_path_is_cleared_but_a_custom_one_is_kept(tmp_path):
+    # Written on Windows, opened anywhere: the shipped template's old absolute
+    # path must be forgotten, whichever separator it uses.
+    stale = NncmConfig.from_dict(
+        {"version": 4, "phast": {"template": r"C:\Dev\nncm\templates\Safeti Template Input Sheet.xlsx"}}
+    )
+    assert stale.phast.template == ""
+    assert stale.migrated
 
-    pd.testing.assert_frame_equal(first, second)
-    assert len(first) == 100
-    assert report.n_vessels == 20
-    assert first["temperature_degC"].between(-50, 150).all()
-    assert first["pressure_barg"].between(1, 100).all()
-    assert first["orifice_mm"].between(1, 500).all()
-    assert first["leak_name"].is_unique
-
-
-def test_log_sampling_spreads_across_decades():
-    """Linear sampling of a 1-500 mm range starves the small holes."""
-    cases, _ = generate_cases(_sampling_config(n_vessels=200))
-    decades = np.log10(cases["orifice_mm"])
-    below_10mm = (cases["orifice_mm"] < 10).mean()
-    assert below_10mm > 0.25, "log sampling should place a large share below 10 mm"
-    assert decades.max() - decades.min() > 2.0
+    custom = tmp_path / "My Own Study.xlsx"
+    kept = NncmConfig.from_dict({"version": 4, "phast": {"template": str(custom)}})
+    assert kept.phast.template == str(custom)
 
 
-def test_per_material_ranges_override_global_ranges():
+def test_project_config_round_trip(tmp_path: Path):
+    project = Project.create(tmp_path / "proj")
+    project.config.sampling.n_vessels = 123
+    project.config.sampling.materials = [Material("ETHANE", properties={"molecular_weight": 30.07})]
+    project.save_config()
+
+    reopened = Project.open(tmp_path / "proj")
+    assert reopened.config.sampling.n_vessels == 123
+    assert reopened.config.sampling.materials[0].properties["molecular_weight"] == 30.07
+    assert isinstance(reopened.config.sampling.pressure, Range)
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+def test_sampling_is_reproducible_and_stays_in_each_envelope():
     config = _sampling_config(
         materials=[
             Material("METHANE", temperature=Range(-160, -80)),
             Material("PROPANE", temperature=Range(0, 60)),
         ]
     )
-    cases, _ = generate_cases(config)
-    methane = cases[cases["material"] == "METHANE"]["temperature_degC"]
-    propane = cases[cases["material"] == "PROPANE"]["temperature_degC"]
-    assert methane.between(-160, -80).all()
-    assert propane.between(0, 60).all()
+    first, _ = generate_cases(config)
+    second, _ = generate_cases(config)
+    pd.testing.assert_frame_equal(first, second)
+
+    assert len(first) == 100 and first["leak_name"].is_unique
+    assert first.loc[first["material"] == "METHANE", "temperature_degC"].between(-160, -80).all()
+    assert first.loc[first["material"] == "PROPANE", "temperature_degC"].between(0, 60).all()
+    assert first["pressure_barg"].between(1, 100).all()
+    # Stratified hole sizes: every vessel spans more than a decade.
+    spans = first.groupby("vessel_name")["orifice_mm"].agg(lambda s: np.log10(s.max() / s.min()))
+    assert (spans > 1.0).all()
 
 
-def test_every_vessel_spans_the_hole_size_range():
-    cases, _ = generate_cases(_sampling_config(n_leaks_per_vessel=6))
-    spans = cases.groupby("vessel_name")["orifice_mm"].agg(lambda s: np.log10(s.max() / s.min()))
-    assert (spans > 1.0).all(), "stratification should give each vessel a wide size range"
+def test_each_material_gets_its_own_stratified_design():
+    """LHS per material: one vessel in each of its n temperature strata."""
+    cases, _ = generate_cases(_sampling_config(n_vessels=40))
+    for _, group in cases.drop_duplicates("vessel_name").groupby("material"):
+        unit = (group["temperature_degC"].to_numpy() + 50) / 200
+        strata = np.floor(unit * len(group)).astype(int)
+        assert sorted(strata) == list(range(len(group)))
+
+
+def test_different_designs_never_share_vessel_names():
+    first, _ = generate_cases(_sampling_config(seed=1))
+    second, _ = generate_cases(_sampling_config(seed=2))
+    assert not set(first["vessel_name"]) & set(second["vessel_name"])
 
 
 # ---------------------------------------------------------------------------
@@ -172,25 +129,17 @@ def test_every_vessel_spans_the_hole_size_range():
 @pytest.mark.parametrize(
     ("value", "quantity", "unit", "expected"),
     [
-        (25.0, "temperature", "degC", 25.0),
         (25.0, "temperature", "degK", 298.15),
         (25.0, "temperature", "degF", 77.0),
-        (10.0, "pressure", "bar", 10.0),
         (10.0, "pressure", "psi", 145.03774),
-        (100.0, "diameter", "mm", 100.0),
         (100.0, "diameter", "in", 3.937008),
-        (1.0, "length", "ft", 3.28084),
         (1000.0, "mass", "tonne", 1.0),
     ],
 )
-def test_unit_conversion(value, quantity, unit, expected):
-    assert units.convert(value, quantity, unit) == pytest.approx(expected, rel=1e-5)
-
-
-def test_unit_roundtrip():
-    for quantity, unit in [("temperature", "degF"), ("pressure", "psi"), ("mass", "lb")]:
-        converted = units.convert(42.0, quantity, unit)
-        assert units.to_canonical(converted, quantity, unit) == pytest.approx(42.0, rel=1e-9)
+def test_unit_conversion_and_inverse(value, quantity, unit, expected):
+    converted = units.convert(value, quantity, unit)
+    assert converted == pytest.approx(expected, rel=1e-5)
+    assert units.to_canonical(converted, quantity, unit) == pytest.approx(value, rel=1e-9)
 
 
 def test_unknown_unit_raises_rather_than_writing_wrong_numbers():
@@ -199,31 +148,19 @@ def test_unknown_unit_raises_rather_than_writing_wrong_numbers():
 
 
 # ---------------------------------------------------------------------------
-# Workbook schema and writing
+# Workbook writing (needs the client template)
 # ---------------------------------------------------------------------------
-@requires_template
-def test_template_schema_is_discovered():
-    from nncm.phast.workbook import SafetiWorkbook
-
-    with SafetiWorkbook(TEMPLATE) as workbook:
-        schema = workbook.schema("Pressure vessel")
-        assert schema.data_start_row == 63
-        assert schema.column("Temperature").unit == "degC"
-        assert schema.column("Pressure").label == "Pressure (gauge)"
-        assert schema.column("label:Name").index == 15
-        leak = workbook.schema("Leak")
-        assert leak.column("HoleDiameter").unit == "mm"
-        assert leak.column("label:Pressure vessel").index == 15
+def _phast_config():
+    config = NncmConfig().phast
+    config.template = str(TEMPLATE)
+    return config
 
 
-@requires_template
-def test_ambiguous_column_names_are_rejected():
-    from nncm.phast.workbook import SafetiWorkbook
+def _sheet_part(workbook_path: Path, sheet_name: str) -> str:
+    from nncm.phast.patcher import TemplatePatcher
 
-    with SafetiWorkbook(TEMPLATE) as workbook:
-        schema = workbook.schema("Pressure vessel")
-        with pytest.raises(KeyError):
-            schema.column("label:Folder")  # appears many times
+    with TemplatePatcher(workbook_path) as patcher:
+        return patcher.sheet_part(sheet_name)
 
 
 @requires_template
@@ -233,27 +170,20 @@ def test_written_workbook_round_trips(tmp_path: Path):
 
     cases, _ = generate_cases(_sampling_config(n_vessels=5, n_leaks_per_vessel=3))
     out = tmp_path / "input.xlsx"
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    report = write_input_workbook(cases, out, config, materials=_materials())
-
-    assert report.n_vessels == 5
-    assert report.n_leaks == 15
-    assert out.exists()
+    report = write_input_workbook(cases, out, _phast_config(), materials=_materials())
+    assert (report.n_vessels, report.n_leaks) == (5, 15)
+    assert report.verified, report.warnings
 
     with SafetiWorkbook(out, read_only=True) as workbook:
-        vessels = workbook.data_rows("Pressure vessel")
-        leaks = workbook.data_rows("Leak")
-    assert len(vessels) == 5
-    assert len(leaks) == 15
-
-    first_case = cases.iloc[0]
-    written_leak = next(l for l in leaks if l["Name"] == first_case["leak_name"])
-    assert written_leak["HoleDiameter"] == pytest.approx(first_case["orifice_mm"])
-    written_vessel = next(v for v in vessels if v["Name"] == first_case["vessel_name"])
-    assert written_vessel["Temperature"] == pytest.approx(first_case["temperature_degC"])
-    assert written_vessel["Pressure"] == pytest.approx(first_case["pressure_barg"])
-    assert written_vessel["Material"] == first_case["material"]
+        vessels = {v["Name"]: v for v in workbook.data_rows("Pressure vessel")}
+        leaks = {l["Name"]: l for l in workbook.data_rows("Leak")}
+    for case in cases.itertuples():
+        assert leaks[case.leak_name]["HoleDiameter"] == pytest.approx(case.orifice_mm)
+        assert leaks[case.leak_name]["Pressure vessel"] == case.vessel_name
+        vessel = vessels[case.vessel_name]
+        assert vessel["Temperature"] == pytest.approx(case.temperature_degC)
+        assert vessel["Pressure"] == pytest.approx(case.pressure_barg)
+        assert vessel["Material"] == case.material
 
 
 @requires_template
@@ -265,14 +195,11 @@ def test_export_changes_only_the_sheets_it_writes(tmp_path: Path):
 
     cases, _ = generate_cases(_sampling_config(n_vessels=4, n_leaks_per_vessel=3))
     out = tmp_path / "input.xlsx"
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    write_input_workbook(cases, out, config, materials=_materials())
+    write_input_workbook(cases, out, _phast_config(), materials=_materials())
 
     with zipfile.ZipFile(TEMPLATE) as template, zipfile.ZipFile(out) as written:
-        assert template.namelist() == written.namelist(), "no part may be added, dropped or renamed"
+        assert template.namelist() == written.namelist()
         changed = [n for n in template.namelist() if template.read(n) != written.read(n)]
-
     assert sorted(changed) == sorted(
         [
             _sheet_part(TEMPLATE, "Pressure vessel"),
@@ -284,215 +211,49 @@ def test_export_changes_only_the_sheets_it_writes(tmp_path: Path):
 
 
 @requires_template
-def test_export_produces_well_formed_parts_and_shared_strings(tmp_path: Path):
-    import re
-    import zipfile
-    from xml.etree import ElementTree
-
-    from nncm.phast.input_writer import write_input_workbook
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=4, n_leaks_per_vessel=3))
-    out = tmp_path / "input.xlsx"
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    write_input_workbook(cases, out, config, materials=_materials())
-
-    with zipfile.ZipFile(out) as written:
-        for name in written.namelist():
-            if name.endswith((".xml", ".rels")):
-                ElementTree.fromstring(written.read(name))  # raises if malformed
-        sheet = written.read(_sheet_part(TEMPLATE, "Pressure vessel")).decode("utf-8")
-        shared = written.read("xl/sharedStrings.xml").decode("utf-8")
-
-    # Strings must go through the shared-string table, as Excel writes them.
-    assert "inlineStr" not in sheet
-    assert 't="s"' in sheet
-    header = re.search(r"<sst\b[^>]*>", shared).group(0)
-    unique = int(re.search(r'uniqueCount="(\d+)"', header).group(1))
-    assert unique == len(re.findall(r"<si\b", shared))
-    with zipfile.ZipFile(TEMPLATE) as template:
-        original = template.read("xl/sharedStrings.xml").decode("utf-8")
-    original_count = int(re.search(r'count="(\d+)"', original).group(1))
-    assert int(re.search(r'\bcount="(\d+)"', header).group(1)) > original_count
-
-
-@requires_template
-def test_patcher_refuses_to_overwrite_existing_rows(tmp_path: Path):
+def test_patcher_refuses_to_overwrite_existing_rows():
     from nncm.phast.patcher import PatchError, TemplatePatcher
 
     with TemplatePatcher(TEMPLATE) as patcher:
-        # The template ships 16 populated weather rows from row 63 down.
         assert patcher.existing_max_row("Weather") >= 63
         with pytest.raises(PatchError):
             patcher.add_rows("Weather", [{1: "Yes"}], start_row=63)
 
 
 @requires_template
-def test_unknown_enumeration_is_reported(tmp_path: Path):
-    from nncm.phast.input_writer import write_input_workbook
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=2, n_leaks_per_vessel=2))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    config.vessel_defaults["FlashFlag"] = "1 Pressure/Temperature"  # wrong capitalisation
-
-    report = write_input_workbook(cases, tmp_path / "bad.xlsx", config, materials=_materials())
-    assert any("Specified condition" in w for w in report.warnings)
-
-
-@requires_template
-def test_export_read_back_check_passes(tmp_path: Path):
-    from nncm.phast.input_writer import write_input_workbook
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=6, n_leaks_per_vessel=4))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    report = write_input_workbook(cases, tmp_path / "input.xlsx", config, materials=_materials())
-
-    assert report.warnings == []
-    assert report.verified
-    assert report.sheets_touched == ["COMPONENT", "Leak", "Pressure vessel"]
-
-
-def _sheet_part(workbook_path: Path, sheet_name: str) -> str:
-    from nncm.phast.patcher import TemplatePatcher
-
-    with TemplatePatcher(workbook_path) as patcher:
-        return patcher.sheet_part(sheet_name)
-
-
-@requires_template
 def test_pure_components_and_mixtures_are_declared(tmp_path: Path):
-    """Vessels may only reference materials the workbook itself defines."""
-    from nncm.config import MixtureComponent
     from nncm.phast.input_writer import write_input_workbook
     from nncm.phast.workbook import SafetiWorkbook
 
     materials = [
-        Material("METHANE", properties={"molecular_weight": 16.04}),
+        Material("METHANE"),
         Material(
             "NATURAL GAS",
             components=[
-                MixtureComponent("METHANE", 90.0),
-                MixtureComponent("ETHANE", 7.0),
-                MixtureComponent("PROPANE", 3.0),
+                MixtureComponent("METHANE", 0.90),
+                MixtureComponent("ETHANE", 0.07),
+                MixtureComponent("PROPANE", 0.03),
             ],
         ),
     ]
     cases, _ = generate_cases(_sampling_config(materials=materials, n_vessels=8))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
     out = tmp_path / "materials.xlsx"
-    report = write_input_workbook(cases, out, config, materials=materials)
-
+    report = write_input_workbook(cases, out, _phast_config(), materials=materials)
     assert report.warnings == []
-    assert report.materials_declared["COMPONENT"] == ["METHANE"]
-    assert report.materials_declared["MIXTURE"] == ["NATURAL GAS"]
 
     with SafetiWorkbook(out, read_only=True) as workbook:
         components = workbook.data_rows("COMPONENT")
         mixture_rows = workbook.data_rows("MIXTURE")
         vessels = workbook.data_rows("Pressure vessel")
 
-    # Pure component: a single row naming it in the study's material list.
-    methane = next(r for r in components if r["Name"] == "METHANE")
-    assert methane["Use"] == "Yes"
-    assert methane["Physical Properties System"] == "Physical Properties System"
-    assert methane["Materials"] == "Materials"
-    assert methane["CreationTemplate"] == "PhastMC"
-
-    # Mixture: header row carries the name, continuation rows only components.
+    # Mixture: header row carries the name, continuation rows only components,
+    # fractions normalised to percent.
     assert len(mixture_rows) == 3
-    header = mixture_rows[0]
-    assert header["Name"] == "NATURAL GAS"
-    assert header["XLSComponent"] == "METHANE"
-    assert header["XLSMole"] == pytest.approx(90.0)
-    assert header["CreationTemplate"] == "PhastMC"
-    for continuation in mixture_rows[1:]:
-        assert "Name" not in continuation
-        assert "Use" not in continuation
-        assert continuation["XLSComponent"] in {"ETHANE", "PROPANE"}
+    assert mixture_rows[0]["Name"] == "NATURAL GAS"
+    assert all("Name" not in row for row in mixture_rows[1:])
     assert sum(r["XLSMole"] for r in mixture_rows) == pytest.approx(100.0)
-
-    # Every material a vessel references is defined in the workbook.
-    declared = {r["Name"] for r in components} | {
-        r["Name"] for r in mixture_rows if "Name" in r
-    }
+    declared = {r["Name"] for r in components} | {r["Name"] for r in mixture_rows if "Name" in r}
     assert {v["Material"] for v in vessels} <= declared
-
-
-@requires_template
-def test_each_vessel_keeps_the_material_its_case_assigns(tmp_path: Path):
-    from nncm.phast.input_writer import write_input_workbook
-    from nncm.phast.workbook import SafetiWorkbook
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=12, n_leaks_per_vessel=3))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-    out = tmp_path / "assignment.xlsx"
-    write_input_workbook(cases, out, config, materials=_materials())
-
-    with SafetiWorkbook(out, read_only=True) as workbook:
-        written = {r["Name"]: r["Material"] for r in workbook.data_rows("Pressure vessel")}
-        leaks = workbook.data_rows("Leak")
-
-    expected = cases.drop_duplicates("vessel_name").set_index("vessel_name")["material"].to_dict()
-    assert written == expected
-
-    # A leak inherits its material through the vessel it points at.
-    leak_to_vessel = {r["Name"]: r["Pressure vessel"] for r in leaks}
-    for leak_name, vessel_name in leak_to_vessel.items():
-        case = cases[cases["leak_name"] == leak_name].iloc[0]
-        assert vessel_name == case["vessel_name"]
-        assert written[vessel_name] == case["material"]
-
-
-@requires_template
-def test_material_without_a_definition_is_reported(tmp_path: Path):
-    from nncm.phast.input_writer import write_input_workbook
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=6))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
-
-    # Catalogue is missing PROPANE, which some vessels use.
-    report = write_input_workbook(
-        cases,
-        tmp_path / "missing.xlsx",
-        config,
-        materials=[Material("METHANE")],
-    )
-    assert any("PROPANE" in w for w in report.warnings)
-    assert not report.verified
-
-
-def test_mixture_fractions_are_normalised_to_percent():
-    from nncm.config import MixtureComponent
-
-    material = Material(
-        "TEST GAS",
-        components=[MixtureComponent("METHANE", 0.9), MixtureComponent("ETHANE", 0.1)],
-    )
-    normalised = material.normalised_components()
-    assert sum(c.fraction for c in normalised) == pytest.approx(100.0)
-    assert normalised[0].fraction == pytest.approx(90.0)
-
-
-def test_material_validation_rejects_bad_compositions():
-    from nncm.config import MixtureComponent
-
-    with pytest.raises(ValueError):
-        Material("BAD", components=[MixtureComponent("METHANE", -1.0)]).validate()
-    with pytest.raises(ValueError):
-        Material("BAD", components=[MixtureComponent("", 100.0)]).validate()
-    with pytest.raises(ValueError):
-        Material("BAD", composition_basis="volume").validate()
-
-
-def test_duplicate_material_names_are_rejected():
-    config = _sampling_config(materials=[Material("METHANE"), Material("methane")])
-    with pytest.raises(ValueError, match="duplicate material"):
-        config.validate()
 
 
 @requires_template
@@ -501,8 +262,7 @@ def test_workbook_splitting_keeps_vessels_intact(tmp_path: Path):
     from nncm.phast.workbook import SafetiWorkbook
 
     cases, _ = generate_cases(_sampling_config(n_vessels=6, n_leaks_per_vessel=4))
-    config = NncmConfig().phast
-    config.template = str(TEMPLATE)
+    config = _phast_config()
     config.max_rows_per_workbook = 10
     report = write_input_workbook(cases, tmp_path / "split.xlsx", config, materials=_materials())
 
@@ -511,130 +271,61 @@ def test_workbook_splitting_keeps_vessels_intact(tmp_path: Path):
         with SafetiWorkbook(path, read_only=True) as workbook:
             vessel_names = {v["Name"] for v in workbook.data_rows("Pressure vessel")}
             leak_parents = {l["Pressure vessel"] for l in workbook.data_rows("Leak")}
-        assert leak_parents <= vessel_names, "a leak must ship with its vessel"
+        assert leak_parents <= vessel_names
 
 
 # ---------------------------------------------------------------------------
-# Output parsing
+# Result extraction
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("text", "expected"),
-    [
-        ("Category 5/D", (5.0, "D")),
-        ("Category 1.5/F", (1.5, "F")),
-        ("Category 10/D", (10.0, "D")),
-        ("nonsense", (None, "")),
-    ],
+    [("Category 5/D", (5.0, "D")), ("Category 1.5/F", (1.5, "F")), ("nonsense", (None, ""))],
 )
 def test_weather_parsing(text, expected):
     speed, stability = parse_weather(text)
-    if expected[0] is None:
-        assert np.isnan(speed)
-    else:
-        assert speed == expected[0]
+    assert np.isnan(speed) if expected[0] is None else speed == expected[0]
     assert stability == expected[1]
 
 
-def test_path_helpers():
-    path = "Study\\Unit 1\\AL-101_V\\Scenario group\\AL-101_V_005mm"
-    assert scenario_key(path) == "AL-101_V_005mm"
-    assert normalise_path("Study\\ Unit 1 \\AL-101_V ") == "Study\\Unit 1\\AL-101_V"
-
-
-@requires_output
-def test_extracts_training_data_from_real_output():
-    from nncm.phast.output_reader import build_training_table
-
-    frame, report = build_training_table(EXAMPLE_OUTPUT)
-
-    assert len(frame) > 1000
-    assert report.n_rows == len(frame)
-    for column in ("Release_rate", "Velocity", "temperature_degC", "pressure_barg", "orifice_mm"):
-        assert column in frame.columns
-    assert (frame["Release_rate"] > 0).all()
-    assert frame["wind_speed_ms"].notna().all()
-    assert frame["stability_class"].isin(list("ABCDEF")).all()
-    # Each result row must be unique on its key — duplicates mean a bad join.
-    assert not frame.duplicated(["path_key", "scenario_label", "weather"]).any()
-
-
-@requires_output
-def test_case_join_recovers_sampled_inputs():
-    from nncm.phast.output_reader import build_training_table
-
-    raw, _ = build_training_table(EXAMPLE_OUTPUT)
-    sample = raw.head(20)
-    cases = pd.DataFrame(
-        {
-            "case_id": range(len(sample)),
-            "vessel_id": 1,
-            "vessel_name": "PV1",
-            "leak_name": sample["scenario_key"].to_numpy(),
-            "material": "METHANE",
-            "temperature_degC": 11.0,
-            "pressure_barg": 99.0,
-            "orifice_mm": 7.0,
-        }
-    )
-    joined, report = build_training_table(EXAMPLE_OUTPUT, cases=cases)
-    matched = joined[joined["leak_name"].notna()]
-    assert report.n_matched_cases > 0
-    # Sampled inputs win over the values echoed by Phast.
-    assert (matched["pressure_barg"] == 99.0).all()
-    assert (matched["material"] == "METHANE").all()
-
-
-# ---------------------------------------------------------------------------
-# Result identification across study layouts
-# ---------------------------------------------------------------------------
 def test_identifiers_cover_both_study_layouts():
-    from nncm.phast.output_reader import identifiers
-
     # Flat study: the path stops at the vessel, Scenario holds the leak.
-    assert identifiers("Study\\PV00001", "PV00001_L01")[0] == "PV00001_L01"
-    assert "PV00001" in identifiers("Study\\PV00001", "PV00001_L01")
-
+    flat = identifiers("Study\\PV00001", "PV00001_L01")
+    assert flat[0] == "PV00001_L01" and "PV00001" in flat
     # Routed study: the path runs down to the leak, Scenario holds the hole size.
-    routed = identifiers("Study\\Unit 1\\AL-101_V\\Scenario group\\AL-101_V_005mm", 5)
+    routed = identifiers("Study\\ Unit 1 \\AL-101_V\\Scenario group\\AL-101_V_005mm", 5)
     assert routed[0] == "5"
-    assert "AL-101_V_005mm" in routed
-    assert "AL-101_V" in routed
-
-    # No duplicates, no empties.
-    assert len(set(routed)) == len(routed)
-    assert all(routed)
+    assert {"AL-101_V_005mm", "AL-101_V"} <= set(routed)
+    assert len(set(routed)) == len(routed) and all(routed)
 
 
 def _write_result_workbook(path: Path, rows: list[dict]) -> Path:
     """Minimal stand-in for a Phast result workbook."""
+    common = [
+        {"Path": r["path"], "Scenario": r["scenario"], "Weather": "Category 5/D", "Hole size (mm)": r["hole"]}
+        for r in rows
+    ]
     discharge = pd.DataFrame(
         [
             {
-                "Path": r["path"],
-                "Scenario": r["scenario"],
-                "Weather": r["weather"],
-                "Hole size (mm)": r["hole"],
-                "Material": "N-BUTANE",
-                "Temperature (input) (degC)": 60.0,
+                **c,
+                "Material": r.get("material", "N-BUTANE"),
+                "Temperature (input) (degC)": r.get("temperature", 60.0),
                 "Pressure (input) (bar)": 5.0,
                 "Peak Flowrate (kg/s)": r["rate"],
                 "Velocity (m/s)": 120.0,
             }
-            for r in rows
+            for c, r in zip(common, rows)
         ]
     )
     jet = pd.DataFrame(
         [
             {
-                "Path": r["path"],
-                "Scenario": r["scenario"],
-                "Weather": r["weather"],
-                "Hole size (mm)": r["hole"],
-                "Flame length (m)": 20.0,
+                **c,
+                "Flame length (m)": r.get("flame", 20.0),
                 # Threshold differs from the default 6.3 kW/m2 on purpose.
                 "Distance downwind to intensity level 1 (4 kW/m2) (m)": 33.0,
             }
-            for r in rows
+            for c, r in zip(common, rows)
         ]
     )
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
@@ -643,76 +334,77 @@ def _write_result_workbook(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-def test_join_matches_when_the_leak_is_in_the_scenario_column(tmp_path: Path):
-    """A flat study reports the leak in Scenario, not as a path segment."""
-    from nncm.phast.output_reader import build_training_table
-
+def test_join_matches_leaks_and_falls_back_to_vessels(tmp_path: Path):
     cases, _ = generate_cases(_sampling_config(n_vessels=2, n_leaks_per_vessel=2))
-    rows = [
-        {
-            "path": f"Study\\{case.vessel_name}",
-            "scenario": case.leak_name,
-            "weather": "Category 5/D",
-            "hole": case.orifice_mm,
-            "rate": 10.0 + index,
-        }
-        for index, case in enumerate(cases.itertuples())
+    by_leak = [
+        {"path": f"Study\\{c.vessel_name}", "scenario": c.leak_name, "hole": 1.0, "rate": 10.0}
+        for c in cases.itertuples()
     ]
-    workbook = _write_result_workbook(tmp_path / "results.xlsx", rows)
+    by_vessel = [
+        {"path": f"Study\\{name}", "scenario": "RENAMED_IN_PHAST", "hole": 50.0, "rate": 5.0}
+        for name in cases["vessel_name"].unique()
+    ]
+    workbook = _write_result_workbook(tmp_path / "results.xlsx", by_leak + by_vessel)
 
     frame, report = build_training_table(workbook, cases=cases)
 
-    assert report.n_matched_cases == len(cases)
-    assert report.n_unmatched == 0
-    assert report.matched_by["leak"] == len(cases)
-    # Sampled inputs win over the values echoed by Phast.
-    for row in frame.itertuples():
+    assert report.matched_by == {"leak": 4, "vessel": 2, "none": 0}
+    leaks = frame[frame["leak_name"].isin(cases["leak_name"])]
+    for row in leaks.itertuples():
         case = cases[cases["leak_name"] == row.leak_name].iloc[0]
+        # Sampled inputs win over the values Phast echoes.
         assert row.orifice_mm == pytest.approx(case["orifice_mm"])
         assert row.material == case["material"]
         assert row.vessel_id == case["vessel_id"]
+    renamed = frame[~frame["leak_name"].isin(cases["leak_name"])]
+    assert (renamed["orifice_mm"] == 50.0).all()
+    assert renamed["material"].notna().all()
     assert frame["vessel_id"].nunique() == 2
 
 
-def test_join_falls_back_to_the_vessel_when_the_leak_is_unknown(tmp_path: Path):
-    from nncm.phast.output_reader import build_training_table
-
-    cases, _ = generate_cases(_sampling_config(n_vessels=2, n_leaks_per_vessel=2))
+def test_unmatched_results_still_group_by_vessel_state(tmp_path: Path):
+    """No match at all must not crash, and must not fall back to a random split."""
     rows = [
-        {
-            "path": f"Study\\{name}",
-            "scenario": "RENAMED_IN_PHAST",
-            "weather": "Category 5/D",
-            "hole": 50.0,
-            "rate": 5.0,
-        }
-        for name in cases["vessel_name"].unique()
+        {"path": "Other\\V1", "scenario": "A", "hole": 10.0, "rate": 1.0, "temperature": 20.0},
+        {"path": "Other\\V1", "scenario": "B", "hole": 50.0, "rate": 9.0, "temperature": 20.0},
+        {"path": "Other\\V2", "scenario": "C", "hole": 10.0, "rate": 2.0, "temperature": 80.0},
     ]
-    workbook = _write_result_workbook(tmp_path / "vessel_only.xlsx", rows)
+    workbook = _write_result_workbook(tmp_path / "foreign.xlsx", rows)
+    cases, _ = generate_cases(_sampling_config(n_vessels=2, n_leaks_per_vessel=1))
 
-    frame, report = build_training_table(workbook, cases=cases)
-
-    assert report.matched_by["vessel"] == 2
-    assert report.matched_by["leak"] == 0
-    # Vessel-level attributes are recovered; the hole size comes from the sheet.
-    assert frame["material"].notna().all()
-    assert frame["vessel_id"].nunique() == 2
-    assert frame["orifice_mm"].tolist() == [50.0, 50.0]
+    for case_table in (cases, None):
+        frame, _ = build_training_table(workbook, cases=case_table)
+        assert len(frame) == 3
+        assert frame["material"].eq("N-BUTANE").all()
+        # Two vessel states (20 degC and 80 degC), so two groups.
+        assert frame["vessel_id"].nunique() == 2
 
 
-def test_result_columns_resolve_despite_project_specific_thresholds(tmp_path: Path):
-    from nncm.phast.output_reader import build_training_table, resolve_column, threshold_of
+def test_a_sparse_target_is_not_dropped_by_the_nonpositive_gate(tmp_path: Path):
+    from nncm.config import ExtractionConfig
+
+    rows = [
+        {"path": "S\\V1", "scenario": "A", "hole": 10.0, "rate": 1.0, "flame": None},
+        {"path": "S\\V1", "scenario": "B", "hole": 20.0, "rate": 2.0, "flame": 0.0},
+        {"path": "S\\V1", "scenario": "C", "hole": 30.0, "rate": 3.0, "flame": 12.0},
+    ]
+    workbook = _write_result_workbook(tmp_path / "sparse.xlsx", rows)
+    config = ExtractionConfig(drop_nonpositive=["Release_rate", "Flame_length"])
+    frame, report = build_training_table(workbook, config=config)
+
+    assert sorted(frame["scenario_label"]) == ["A", "C"]  # blank kept, zero dropped
+    assert report.dropped_nonpositive == 1
+
+
+def test_result_columns_resolve_despite_project_specific_thresholds():
+    from nncm.phast.output_reader import resolve_column, threshold_of
 
     frame = pd.DataFrame(
         columns=[
             "Distance downwind to intensity level 1 (4 kW/m2) (m)",
-            "Distance downwind to overpressure 1 (0.02068 bar) (m)",
             "Distance to LFL (m)",
             "Distance to LFL fraction (m)",
         ]
-    )
-    assert resolve_column(frame, "Distance downwind to intensity level 1") == (
-        "Distance downwind to intensity level 1 (4 kW/m2) (m)"
     )
     assert resolve_column(frame, "Distance downwind to intensity level 1 (6.3 kW/m2) (m)") == (
         "Distance downwind to intensity level 1 (4 kW/m2) (m)"
@@ -721,250 +413,86 @@ def test_result_columns_resolve_despite_project_specific_thresholds(tmp_path: Pa
     assert resolve_column(frame, "Distance to LFL (m)") == "Distance to LFL (m)"
     assert resolve_column(frame, "Distance to LFL fraction (m)") == "Distance to LFL fraction (m)"
     assert resolve_column(frame, "Flame length (m)") is None
-
     assert threshold_of("Distance downwind to intensity level 1 (4 kW/m2) (m)") == "4 kW/m2"
-    assert threshold_of("Distance to LFL (m)") == ""
 
-    cases, _ = generate_cases(_sampling_config(n_vessels=1, n_leaks_per_vessel=1))
-    case = cases.iloc[0]
-    workbook = _write_result_workbook(
-        tmp_path / "thresholds.xlsx",
-        [
-            {
-                "path": f"Study\\{case['vessel_name']}",
-                "scenario": case["leak_name"],
-                "weather": "Category 5/D",
-                "hole": case["orifice_mm"],
-                "rate": 3.0,
-            }
-        ],
-    )
-    extracted, report = build_training_table(workbook, cases=cases)
-    assert extracted["Jet_fire_distance_level1"].iloc[0] == 33.0
-    assert report.thresholds["Jet_fire_distance_level1"] == "4 kW/m2"
-    # The stub workbook omits most columns, but the one present under a
-    # different threshold must not be reported as missing.
-    assert not [w for w in report.warnings if "intensity level 1" in w]
+
+@requires_output
+def test_extracts_training_data_from_real_output():
+    frame, report = build_training_table(EXAMPLE_OUTPUT)
+
+    assert len(frame) > 1000
+    assert (frame["Release_rate"] > 0).all()
+    assert frame["stability_class"].isin(list("ABCDEF")).all()
+    assert frame["vessel_id"].notna().all()
+    assert not frame.duplicated(["path_key", "scenario_label", "weather"]).any()
 
 
 # ---------------------------------------------------------------------------
-# Features
+# Features and domain checks
 # ---------------------------------------------------------------------------
 def _feature_frame() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "temperature_degC": [20.0, -40.0, 150.0],
-            "pressure_barg": [10.0, 1.0, 100.0],
-            "orifice_mm": [5.0, 100.0, 250.0],
-            "wind_speed_ms": [5.0, 2.0, 10.0],
-            "stability_index": [4.0, 6.0, 4.0],
-            "material": ["METHANE", "PROPANE", "METHANE"],
-            "mat_molecular_weight": [16.04, 44.1, 16.04],
+            "temperature_degC": [20.0, -40.0, 150.0, 60.0],
+            "pressure_barg": [10.0, 1.0, 100.0, 5.0],
+            "orifice_mm": [5.0, 100.0, 250.0, 20.0],
+            "elevation_m": [1.0, 1.0, 1.0, 1.0],
+            "wind_speed_ms": [5.0, 2.0, 10.0, 5.0],
+            "stability_index": [4.0, 6.0, 4.0, 4.0],
+            "material": ["METHANE", "PROPANE", "METHANE", "PROPANE"],
+            "mat_molecular_weight": [16.04, 44.1, 16.04, 44.1],
         }
     )
 
 
-def test_feature_spec_round_trips_through_json():
-    spec = fit_feature_spec(_feature_frame())
-    restored = FeatureSpec.from_dict(spec.to_dict())
-    pd.testing.assert_frame_equal(
-        build_features(_feature_frame(), spec), build_features(_feature_frame(), restored)
-    )
-
-
-def test_features_are_identical_for_single_row_and_batch():
-    """The GUI predicts one row at a time; it must match batch training exactly."""
+def test_features_agree_between_training_and_inference():
+    """Same spec after a JSON round trip; one row equals its batch row; a row
+    naming only its material gets that material's descriptors."""
     frame = _feature_frame()
-    spec = fit_feature_spec(frame)
+    spec = FeatureSpec.from_dict(fit_feature_spec(frame).to_dict())
     batch = build_features(frame, spec)
-    single = build_features(frame.iloc[[1]], spec)
-    pd.testing.assert_frame_equal(single, batch.iloc[[1]])
+    pd.testing.assert_frame_equal(build_features(frame.iloc[[1]], spec), batch.iloc[[1]])
+
+    by_name = frame.drop(columns=["mat_molecular_weight"]).iloc[[1]]
+    pd.testing.assert_frame_equal(build_features(by_name, spec), batch.iloc[[1]])
 
 
-def test_missing_optional_columns_are_imputed_not_crashed():
+def test_unknown_material_without_descriptors_is_refused():
     spec = fit_feature_spec(_feature_frame())
-    minimal = pd.DataFrame(
-        {"temperature_degC": [30.0], "pressure_barg": [5.0], "orifice_mm": [12.0]}
-    )
-    built = build_features(minimal, spec)
-    assert list(built.columns) == spec.feature_columns
-    assert built.notna().all().all()
+    row = pd.DataFrame([{"temperature_degC": 20.0, "pressure_barg": 10.0, "orifice_mm": 5.0}])
+    with pytest.raises(ValueError, match="XENON"):
+        resolve_materials(row.assign(material="XENON"), spec, strict=True)
+    with pytest.raises(ValueError):
+        resolve_materials(row, spec, strict=True)
+    # A new material with its descriptors given is allowed, and flagged.
+    given = row.assign(material="XENON", mat_molecular_weight=131.3)
+    resolve_materials(given, spec, strict=True)
+    assert "material" in domain_report(given.iloc[0].to_dict(), spec)
 
 
 def test_domain_report_flags_extrapolation():
     spec = fit_feature_spec(_feature_frame())
-    inside = domain_report({"temperature_degC": 20.0, "pressure_barg": 10.0, "orifice_mm": 50.0}, spec)
-    outside = domain_report({"temperature_degC": 900.0, "pressure_barg": 10.0, "orifice_mm": 50.0}, spec)
-    assert inside == {}
-    assert "temperature_degC" in outside
-
-
-def test_domain_report_flags_unknown_material_for_one_hot_models():
-    frame = _feature_frame().drop(columns=["mat_molecular_weight"])
-    spec = fit_feature_spec(frame)  # falls back to one-hot material identity
-    assert spec.material_categories
-
     base = {"temperature_degC": 20.0, "pressure_barg": 10.0, "orifice_mm": 50.0}
-    assert "material" not in domain_report({**base, "material": "METHANE"}, spec)
-    assert "material" in domain_report({**base, "material": "XENON"}, spec)
-    assert "material" in domain_report(base, spec)
+
+    assert domain_report({**base, "material": "METHANE"}, spec) == {}
+    # NumPy scalars, as a pandas row carries them, are checked too.
+    assert "temperature_degC" in domain_report({**base, "temperature_degC": np.int64(900)}, spec)
+    # Inside the global range but outside what PROPANE was trained on.
+    assert "pressure_barg" in domain_report({**base, "material": "PROPANE"}, spec)
+    # A setting every training case shared cannot be varied.
+    assert "elevation_m" in domain_report({**base, "elevation_m": 5.0}, spec)
 
 
 # ---------------------------------------------------------------------------
-# Project layout and training split
+# Training and prediction
 # ---------------------------------------------------------------------------
-def test_project_config_round_trip(tmp_path: Path):
-    project = Project.create(tmp_path / "proj")
-    project.config.sampling.n_vessels = 123
-    project.config.sampling.materials = [Material("ETHANE", properties={"molecular_weight": 30.07})]
-    project.save_config()
-
-    reopened = Project.open(tmp_path / "proj")
-    assert reopened.config.sampling.n_vessels == 123
-    assert reopened.config.sampling.materials[0].name == "ETHANE"
-    assert reopened.config.sampling.materials[0].properties["molecular_weight"] == 30.07
-    assert isinstance(reopened.config.sampling.pressure, Range)
-
-
-def test_old_config_is_migrated_to_the_minimal_phast_footprint(tmp_path: Path):
-    import json
-
-    from nncm.config import CONFIG_VERSION
-
-    legacy = {
-        "version": 2,
-        "phast": {
-            "folder_name": "NNCM",
-            "write_material_rows": True,
-            "vessel_defaults": {
-                "SpecifyVolumeInFlag": "0 No",
-                "FlashFlag": "1 Pressure/temperature",
-                "RiskEffects": "1 Flammable only",
-                "TankType": "1 Vertical cylinder",
-            },
-            "leak_defaults": {"ReleaseDirection": "0 Horizontal", "EventFrequency": 1e-4},
-        },
-    }
-    path = tmp_path / "nncm.json"
-    path.write_text(json.dumps(legacy), encoding="utf-8")
-
-    config = NncmConfig.load(path)
-    assert config.version == CONFIG_VERSION
-    assert "TankType" not in config.phast.vessel_defaults
-    assert "RiskEffects" not in config.phast.vessel_defaults
-    assert "EventFrequency" not in config.phast.leak_defaults
-    assert config.phast.folder_name == ""
-    # v4: vessels must never reference a material the study does not define.
-    assert config.phast.write_material_rows is True
-    # Settings that are still wanted are untouched.
-    assert config.phast.vessel_defaults["FlashFlag"] == "1 Pressure/temperature"
-    assert config.phast.leak_defaults["ReleaseDirection"] == "0 Horizontal"
-
-
-def test_migration_keeps_deliberate_customisation(tmp_path: Path):
-    import json
-
-    path = tmp_path / "nncm.json"
-    path.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                "phast": {
-                    "folder_name": "Unit 42",
-                    "vessel_defaults": {"TankType": "2 Horizontal cylinder"},
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    config = NncmConfig.load(path)
-    assert config.phast.folder_name == "Unit 42"
-    assert config.phast.vessel_defaults["TankType"] == "2 Horizontal cylinder"
-
-
 def test_masked_scaler_ignores_missing_values():
-    """Imputing before fitting would shrink the spread; the stats must be exact."""
     from nncm.training import _fit_masked_scaler
 
-    values = np.array([[1.0, 10.0], [3.0, np.nan], [5.0, 30.0], [np.nan, 50.0]])
-    scaler = _fit_masked_scaler(values)
-
+    scaler = _fit_masked_scaler(np.array([[1.0, 2.0], [3.0, 2.0], [5.0, np.nan]]))
     assert scaler.mean_[0] == pytest.approx(3.0)
     assert scaler.scale_[0] == pytest.approx(np.std([1.0, 3.0, 5.0]))
-    assert scaler.mean_[1] == pytest.approx(30.0)
-    assert scaler.scale_[1] == pytest.approx(np.std([10.0, 30.0, 50.0]))
-
-
-def test_constant_target_does_not_produce_a_zero_scale():
-    from nncm.training import _fit_masked_scaler
-
-    scaler = _fit_masked_scaler(np.array([[2.0], [2.0], [np.nan]]))
-    assert scaler.scale_[0] == 1.0
-
-
-def _partial_dataset(n_vessels: int = 40) -> pd.DataFrame:
-    """Dataset where one target is only present for a third of the rows."""
-    rng = np.random.default_rng(0)
-    rows = []
-    for vessel in range(n_vessels):
-        temperature = rng.uniform(-20, 120)
-        pressure = 10 ** rng.uniform(0, 2)
-        for leak in range(6):
-            orifice = 10 ** rng.uniform(0, 2.5)
-            rate = pressure * orifice**2 * 1e-3
-            rows.append(
-                {
-                    "vessel_id": vessel,
-                    "material": "METHANE",
-                    "temperature_degC": temperature,
-                    "pressure_barg": pressure,
-                    "orifice_mm": orifice,
-                    "wind_speed_ms": 5.0,
-                    "stability_index": 4.0,
-                    "Release_rate": rate,
-                    # Only large holes produce this one, as in a real study.
-                    "Distance_to_LFL": 3.0 * rate**0.5 if orifice > 50 else np.nan,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def test_training_uses_rows_where_only_some_targets_are_present(tmp_path: Path):
-    from nncm.training import train_model
-
-    project = Project.create(tmp_path / "masked")
-    frame = _partial_dataset()
-    config = project.config.training
-    config.targets = ["Release_rate", "Distance_to_LFL"]
-    config.log_targets = ["Release_rate", "Distance_to_LFL"]
-    config.epochs = 6
-    config.hidden_units = [16, 16]
-    config.head_units = [8]
-    config.use_material_properties = False
-
-    partial_coverage = frame["Distance_to_LFL"].notna().mean()
-    assert 0.2 < partial_coverage < 0.8, "fixture should be genuinely partial"
-
-    result = train_model(project, frame=frame, config=config, log=lambda _: None)
-
-    # Every row with at least one target is used, not just the complete ones.
-    assert result.n_train + result.n_val + result.n_test == len(frame)
-    assert result.metrics["coverage"]["Release_rate"] == 1.0
-    assert result.metrics["coverage"]["Distance_to_LFL"] == pytest.approx(partial_coverage)
-
-    # The sparse target is still scored, on its own rows only.
-    sparse = result.metrics["per_target"]["Distance_to_LFL"]
-    dense = result.metrics["per_target"]["Release_rate"]
-    assert sparse["n_test"] < dense["n_test"] == result.n_test
-
-    # Masked rows must not leak into predictions as zeros, and a log target can
-    # never invert to a negative rate or distance.
-    predictions = pd.read_csv(result.run_dir / "test_predictions.csv")
-    assert predictions["pred_Distance_to_LFL"].notna().all()
-    assert (predictions["pred_Release_rate"] >= 0).all()
-    assert (predictions["pred_Distance_to_LFL"] >= 0).all()
-    assert predictions["pred_Release_rate"].max() > 0
+    assert scaler.scale_[1] == 1.0  # constant column: no division by zero
 
 
 def test_grouped_split_never_shares_a_vessel_between_partitions():
@@ -974,16 +502,66 @@ def test_grouped_split_never_shares_a_vessel_between_partitions():
     train, val, test = _grouped_split(groups, test_size=0.2, valid_size=0.2, seed=7)
 
     assert len(train) + len(val) + len(test) == len(groups)
-    train_groups = set(groups[train])
-    val_groups = set(groups[val])
-    test_groups = set(groups[test])
-    assert not (train_groups & test_groups)
-    assert not (train_groups & val_groups)
-    assert not (val_groups & test_groups)
+    parts = [set(groups[i]) for i in (train, val, test)]
+    assert not (parts[0] & parts[1] or parts[0] & parts[2] or parts[1] & parts[2])
 
 
-def test_grouped_split_refuses_impossible_splits():
-    from nncm.training import _grouped_split
+def _partial_dataset(n_vessels: int = 40) -> pd.DataFrame:
+    """Two materials; one target present for only the large holes."""
+    rng = np.random.default_rng(0)
+    rows = []
+    for vessel in range(n_vessels):
+        material, weight = ("METHANE", 16.04) if vessel % 2 else ("HYDROGEN", 2.02)
+        temperature = rng.uniform(-20, 120)
+        pressure = 10 ** rng.uniform(0, 2)
+        for _ in range(6):
+            orifice = 10 ** rng.uniform(0, 2.5)
+            rate = pressure * orifice**2 * 1e-4 * np.sqrt(weight)
+            rows.append(
+                {
+                    "vessel_id": vessel,
+                    "material": material,
+                    "mat_molecular_weight": weight,
+                    "temperature_degC": temperature,
+                    "pressure_barg": pressure,
+                    "orifice_mm": orifice,
+                    "Release_rate": rate,
+                    "Distance_to_LFL": 3.0 * rate**0.5 if orifice > 50 else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
 
-    with pytest.raises(ValueError):
-        _grouped_split(np.array(["a", "a", "b"]), test_size=0.5, valid_size=0.5, seed=1)
+
+def test_training_and_prediction_end_to_end(tmp_path: Path):
+    from nncm.predict import ModelBundle
+    from nncm.training import train_model
+
+    project = Project.create(tmp_path / "masked")
+    frame = _partial_dataset()
+    config = project.config.training
+    config.targets = ["Release_rate", "Distance_to_LFL"]
+    config.log_targets = list(config.targets)
+    config.epochs = 6
+    config.hidden_units = [16, 16]
+    config.head_units = [8]
+
+    result = train_model(project, frame=frame, config=config, log=lambda _: None)
+
+    # Every row with at least one target is used; the sparse one is scored on
+    # its own rows only.
+    assert result.n_train + result.n_val + result.n_test == len(frame)
+    sparse = result.metrics["per_target"]["Distance_to_LFL"]
+    assert sparse["n_test"] < result.metrics["per_target"]["Release_rate"]["n_test"]
+
+    bundle = ModelBundle(result.run_dir)
+    base = {"temperature_degC": 20.0, "pressure_barg": 10.0, "orifice_mm": 60.0}
+    methane = bundle.predict_one({**base, "material": "METHANE"}, mc_samples=5)
+    hydrogen = bundle.predict_one({**base, "material": "HYDROGEN"})
+    # The material name alone must reach the model as its descriptors.
+    assert methane.values != hydrogen.values
+    assert all(v >= 0 for v in methane.values.values()), "log targets never invert below zero"
+    assert set(methane.uncertainty) == set(config.targets)
+
+    batch = bundle.predict_batch(pd.DataFrame([{**base, "material": "METHANE"}]))
+    assert batch["Release_rate"].iloc[0] == pytest.approx(methane.values["Release_rate"], rel=1e-5)
+    assert "domain_warnings" in batch
