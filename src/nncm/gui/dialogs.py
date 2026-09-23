@@ -25,7 +25,7 @@ from .. import theme as T
 from ..config import Material, Range, format_composition, parse_composition
 from . import layout as ly
 from .theme import restyle
-from .widgets import Card, Explanation, Form, RangeField, choice_field, decimal_field
+from .widgets import Card, Form, RangeField, choice_field, decimal_field
 
 PROPERTY_FIELDS = [
     ("molecular_weight", 0.0, 1000.0, 3),
@@ -36,12 +36,10 @@ PROPERTY_FIELDS = [
 ]
 
 class Section(Card):
-    """A titled card in a dialog's scrolling column, with an optional blurb."""
+    """A titled card in a dialog's scrolling column; the blurb is its heading's hover tip."""
 
     def __init__(self, title: str, blurb: str = "", parent: QWidget | None = None):
-        super().__init__(title, parent=parent)
-        if blurb:
-            self.body().insertWidget(1, Explanation(blurb))
+        super().__init__(title, parent=parent, tip=blurb)
         self.form = Form()
         self.add(self.form)
 

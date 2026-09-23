@@ -96,56 +96,20 @@ def is_number(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 # Type and containers
 # ---------------------------------------------------------------------------
-class Explanation(QLabel):
-    """The one job italic has: a sentence saying what a setting changes.
-
-    A wrapped label in a grid comes back one line short unless the height is
-    measured explicitly — Qt asks for a height before it knows the width. So
-    the height is recomputed whenever the width changes, and only then.
-
-    The measuring is done against the font rather than by asking QLabel, whose
-    own answer is floored by the minimum height already set on it. Asked in a
-    loop like this one, that answer can only ever grow: a label measured once
-    while it was briefly narrow would keep the four lines it needed then, for
-    the rest of the session, however wide it later became.
-    """
-
-    def __init__(self, text: str = "", parent: QWidget | None = None):
-        super().__init__(text, parent)
-        self.setProperty("role", "explanation")
-        self.setWordWrap(True)
-        policy = self.sizePolicy()
-        policy.setHeightForWidth(True)
-        policy.setVerticalPolicy(QSizePolicy.Minimum)
-        self.setSizePolicy(policy)
-
-    def heightForWidth(self, width: int) -> int:  # noqa: N802 (Qt naming)
-        margins = self.contentsMargins()
-        usable = max(width - margins.left() - margins.right(), 1)
-        wrapped = self.fontMetrics().boundingRect(
-            0, 0, usable, 1 << 20, Qt.TextWordWrap | self.alignment(), self.text()
-        )
-        return wrapped.height() + margins.top() + margins.bottom()
-
-    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
-        super().setText(text)
-        self.setMinimumHeight(self.heightForWidth(self.width()))
-
-    def resizeEvent(self, event):  # noqa: N802 (Qt naming)
-        super().resizeEvent(event)
-        if event.oldSize().width() != event.size().width():
-            self.setMinimumHeight(self.heightForWidth(self.width()))
-
-
 class Card(QFrame):
     """One bordered surface for one subject. Content inside it stays borderless."""
 
-    def __init__(self, title: str = "", parent: QWidget | None = None):
+    def __init__(self, title: str = "", parent: QWidget | None = None, *, tip: str = ""):
         super().__init__(parent)
         self.setProperty("role", "panel")
         self._layout = ly.vbox(self, margin=T.MARGIN_GROUP, spacing=T.SPACING_ROW)
         if title:
-            self._layout.addWidget(ly.heading(title))
+            heading = ly.heading(title)
+            # What the card does is a hover tip on its heading, not a sentence
+            # printed under it: the surface stays quiet until asked.
+            if tip:
+                heading.setToolTip(tip)
+            self._layout.addWidget(heading)
 
     def body(self):
         return self._layout
@@ -329,7 +293,7 @@ class RangeField(QWidget):
 
 
 class Form(QWidget):
-    """One row is label, editor, unit — with the explanation under both columns.
+    """One row is label, editor, unit; the explanation is the hover tip on both.
 
     Every label, unit and sentence comes from :mod:`nncm.quantities`, so there
     is only ever one copy of each to keep true. A grid rather than a
@@ -345,9 +309,7 @@ class Form(QWidget):
         # The editor column takes the width it needs and the unit follows it;
         # a number stranded at the far side of the pane has lost its label.
         self._grid.setColumnStretch(2, 1)
-        # A form is as tall as its rows and no shorter. Left free to shrink it
-        # gives back the height of the last explanation first, which reads as a
-        # sentence sliced in half by the edge of a card.
+        # A form is as tall as its rows and no shorter.
         policy = self.sizePolicy()
         policy.setVerticalPolicy(QSizePolicy.Fixed)
         self.setSizePolicy(policy)
@@ -359,7 +321,10 @@ class Form(QWidget):
         name = ly.field_label(label if label is not None else quantity.label)
         name.setBuddy(editor)
         if quantity.help:
+            # Explanations live in hover tips, on the label and the editor.
             name.setToolTip(quantity.help)
+            if not editor.toolTip():
+                editor.setToolTip(quantity.help)
         self._grid.addWidget(name, self._row, 0, Qt.AlignLeft | Qt.AlignVCenter)
         if span:
             self._grid.addWidget(editor, self._row, 1, 1, 2)
@@ -369,22 +334,16 @@ class Form(QWidget):
             unit.setMinimumWidth(56)  # units line up down the pane
             self._grid.addWidget(unit, self._row, 2, Qt.AlignLeft | Qt.AlignVCenter)
         self._row += 1
-        if quantity.help:
-            note = Explanation(quantity.help)
-            self._grid.addWidget(note, self._row, 1, 1, 2)
-            self._row += 1
         return editor
 
     def add_switch(self, key: str, box: QCheckBox) -> QCheckBox:
         """A checkbox names itself, so it takes the whole row."""
         quantity = describe(key)
         box.setText(quantity.label)
+        if quantity.help:
+            box.setToolTip(quantity.help)
         self._grid.addWidget(box, self._row, 0, 1, 3)
         self._row += 1
-        if quantity.help:
-            note = Explanation(quantity.help)
-            self._grid.addWidget(note, self._row, 0, 1, 3)
-            self._row += 1
         return box
 
     def add_widget(self, widget: QWidget) -> QWidget:
