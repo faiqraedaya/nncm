@@ -7,7 +7,10 @@ result extractor joins Phast output back onto it by ``leak_name``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import warnings
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +23,7 @@ MAX_MATERIAL_BARS = 10  # rows the vessels-per-material panel stays legible at
 
 CASE_COLUMNS = [
     "case_id",
+    "design_id",
     "vessel_id",
     "vessel_name",
     "leak_name",
@@ -35,6 +39,7 @@ CASE_COLUMNS = [
 
 @dataclass
 class SamplingReport:
+    design_id: str
     n_vessels: int
     n_leaks: int
     materials: dict[str, int]
@@ -42,6 +47,7 @@ class SamplingReport:
 
     def summary(self) -> str:
         lines = [
+            f"design: {self.design_id}",
             f"vessels: {self.n_vessels}",
             f"leak scenarios: {self.n_leaks}",
             "materials: " + ", ".join(f"{k}={v}" for k, v in sorted(self.materials.items())),
@@ -50,12 +56,33 @@ class SamplingReport:
         return "\n".join(lines)
 
 
-def _engine(sampler: str, dim: int, seed: int) -> qmc.QMCEngine:
-    if sampler == "sobol":
-        return qmc.Sobol(d=dim, scramble=True, seed=seed)
+def _unit_samples(sampler: str, n: int, dim: int, seed: int) -> np.ndarray:
+    """``n`` points in the unit cube from the named design."""
     if sampler == "random":
-        return qmc.Halton(d=dim, seed=seed)  # cheap stand-in, still reproducible
-    return qmc.LatinHypercube(d=dim, seed=seed)
+        return np.random.default_rng(seed).random((n, dim))
+    if sampler == "sobol":
+        engine: qmc.QMCEngine = qmc.Sobol(d=dim, scramble=True, seed=seed)
+    elif sampler == "halton":
+        engine = qmc.Halton(d=dim, scramble=True, seed=seed)
+    else:
+        engine = qmc.LatinHypercube(d=dim, seed=seed)
+    with warnings.catch_warnings():
+        # Sobol prefers powers of two; a per-material count rarely is one, and
+        # the loss of balance at these sizes is immaterial.
+        warnings.simplefilter("ignore", UserWarning)
+        return engine.random(n)
+
+
+def design_id(config: SamplingConfig) -> str:
+    """Short, stable identifier of a sampling design.
+
+    Prefixed to every vessel name, so results from two designs never share a
+    name: appending them to one dataset cannot overwrite one scenario with
+    another, and the grouped split never merges two different vessels. The
+    same config always gives the same ID, so a design stays reproducible.
+    """
+    digest = hashlib.sha1(json.dumps(asdict(config), sort_keys=True).encode("utf-8"))
+    return "D" + digest.hexdigest()[:5].upper()
 
 
 def _scale(unit_samples: np.ndarray, bounds: list[Range]) -> np.ndarray:
@@ -92,20 +119,24 @@ def _assign_materials(config: SamplingConfig, rng: np.random.Generator) -> list[
 def generate_cases(config: SamplingConfig) -> tuple[pd.DataFrame, SamplingReport]:
     """Generate the case table for the configured sampling plan."""
     config.validate()
+    design = design_id(config)
     rng = np.random.default_rng(config.seed)
     materials = _assign_materials(config, rng)
 
-    # Vessel-level sample: temperature/pressure in the *unit cube*, rescaled per
-    # material so each fluid stays inside its own physically sensible envelope.
-    vessel_unit = _engine(config.sampler, 2, config.seed).random(config.n_vessels)
-
+    # Vessel-level sample: one space-filling design *per material*, scaled into
+    # that material's own envelope. Drawing one design over all vessels and
+    # dealing it out across materials would leave each material a random
+    # subset of it, with none of the stratification.
     temperatures = np.empty(config.n_vessels)
     pressures = np.empty(config.n_vessels)
-    for i, material in enumerate(materials):
-        t_range = material.temperature or config.temperature
-        p_range = material.pressure or config.pressure
-        scaled = _scale(vessel_unit[i : i + 1], [t_range, p_range])
-        temperatures[i], pressures[i] = scaled[0, 0], scaled[0, 1]
+    for k, material in enumerate(config.materials):
+        indices = [i for i, m in enumerate(materials) if m is material]
+        if not indices:
+            continue
+        unit = _unit_samples(config.sampler, len(indices), 2, config.seed + k)
+        scaled = _scale(unit, [material.temperature or config.temperature,
+                               material.pressure or config.pressure])
+        temperatures[indices], pressures[indices] = scaled[:, 0], scaled[:, 1]
 
     # Leak-level sample: one stratified draw per vessel so every vessel spans
     # the whole hole-size range instead of getting a random clump of sizes.
@@ -126,13 +157,14 @@ def generate_cases(config: SamplingConfig) -> tuple[pd.DataFrame, SamplingReport
     records = []
     case_id = 0
     for i, material in enumerate(materials):
-        vessel_name = f"PV{i + 1:05d}"
+        vessel_name = f"{design}_PV{i + 1:05d}"
         for j in range(n_leaks_each):
             case_id += 1
             records.append(
                 {
                     "case_id": case_id,
-                    "vessel_id": i + 1,
+                    "design_id": design,
+                    "vessel_id": vessel_name,
                     "vessel_name": vessel_name,
                     "leak_name": f"{vessel_name}_L{j + 1:02d}",
                     "material": material.name,
@@ -158,6 +190,7 @@ def generate_cases(config: SamplingConfig) -> tuple[pd.DataFrame, SamplingReport
             )
 
     report = SamplingReport(
+        design_id=design,
         n_vessels=config.n_vessels,
         n_leaks=len(cases),
         materials=cases.groupby("material")["vessel_name"].nunique().to_dict(),

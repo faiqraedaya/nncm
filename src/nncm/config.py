@@ -13,7 +13,7 @@ import json
 import re
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -30,13 +30,21 @@ def shipped_template() -> Path:
     the installation is only true for the machine and the directory it was
     computed on. Stored in ``nncm.json`` it breaks as soon as the checkout
     moves, the project is opened elsewhere, or the app is frozen.
+
+    The template is a client workbook and is not in the repository: place it
+    in ``templates/`` of the checkout, or next to the package when installed,
+    or name one in the project's ``nncm.json``. Searched in that order after a
+    frozen bundle; the checkout location is returned when none exists, so the
+    error names the conventional place.
     """
+    candidates = []
     bundle_root = getattr(sys, "_MEIPASS", None)  # PyInstaller unpack directory
     if bundle_root:
-        bundled = Path(bundle_root) / "templates" / TEMPLATE_NAME
-        if bundled.is_file():
-            return bundled
-    return REPO_ROOT / "templates" / TEMPLATE_NAME
+        candidates.append(Path(bundle_root) / "templates" / TEMPLATE_NAME)
+    candidates.append(PACKAGE_ROOT / "templates" / TEMPLATE_NAME)
+    checkout = REPO_ROOT / "templates" / TEMPLATE_NAME
+    candidates.append(checkout)
+    return next((c for c in candidates if c.is_file()), checkout)
 
 
 DEFAULT_TEMPLATE = shipped_template()
@@ -348,6 +356,9 @@ def default_materials() -> list["Material"]:
     ]
 
 
+SAMPLERS = ("lhs", "sobol", "halton", "random")
+
+
 @dataclass
 class SamplingConfig:
     n_vessels: int = 500
@@ -356,7 +367,7 @@ class SamplingConfig:
     pressure: Range = field(default_factory=lambda: Range(0.5, 200.0, log=True))
     orifice: Range = field(default_factory=lambda: Range(1.0, 500.0, log=True))
     elevation: Range = field(default_factory=lambda: Range(1.0, 1.0))
-    sampler: str = "lhs"              # lhs | sobol | random
+    sampler: str = "lhs"              # lhs | sobol | halton | random
     seed: int = 42
     materials: list[Material] = field(default_factory=lambda: default_materials())
     mass_inventory_kg: float = 50_000.0
@@ -377,7 +388,7 @@ class SamplingConfig:
             raise ValueError(f"duplicate material names: {sorted(duplicates)}")
         for material in self.materials:
             material.validate()
-        if self.sampler not in {"lhs", "sobol", "random"}:
+        if self.sampler not in SAMPLERS:
             raise ValueError(f"unknown sampler '{self.sampler}'")
 
 
@@ -475,6 +486,16 @@ class TrainingConfig:
         ]
     )
     """All four spans decades — log space is the right target space for each."""
+    log_offsets: dict[str, float] = field(
+        default_factory=lambda: {
+            "Release_rate": 1e-4,     # kg/s
+            "Velocity": 0.1,          # m/s
+            "Distance_to_LFL": 0.1,   # m
+            "Flame_length": 0.1,      # m
+        }
+    )
+    """Offset ``c`` in ``log10(y + c)``, in the target's own unit: the smallest
+    value worth resolving. A log target not listed gets 0.1 % of its median."""
     group_column: str = "vessel_id"
     """Rows sharing a vessel share T, P and material; splitting them across
     train/test leaks information and inflates the reported scores."""
@@ -567,7 +588,9 @@ def _drop_stale_template(phast: dict[str, Any]) -> None:
     if not isinstance(stored, str) or not stored:
         return
     path = Path(stored)
-    if path.name != TEMPLATE_NAME:
+    # PureWindowsPath splits on both separators, so a project written on
+    # Windows is recognised when opened on Linux or macOS too.
+    if PureWindowsPath(stored).name != TEMPLATE_NAME:
         return          # a custom template: the user's to fix, not ours
     if path == shipped_template() or not path.is_file():
         phast["template"] = ""
@@ -780,5 +803,9 @@ class Project:
 
 
 def default_project_root() -> Path:
-    """Repo-local workspace used when the user does not name a project."""
-    return REPO_ROOT / "workspace"
+    """``./workspace`` in the working directory, when the user names no project.
+
+    Not relative to the package: installed from a wheel that would put the
+    project inside site-packages.
+    """
+    return Path.cwd() / "workspace"

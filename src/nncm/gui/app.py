@@ -289,10 +289,12 @@ class MainWindow(QMainWindow):
         on_progress: Callable[[int, int], None] | None = None,
         pass_log: bool = True,
         quiet: bool = False,
+        cancellable: bool = False,
     ) -> bool:
         """Run one stage in the background; one stage at a time."""
         started = self.runner.start(
-            task, self.log, on_done, on_error, on_progress=on_progress, pass_log=pass_log
+            task, self.log, on_done, on_error, on_progress=on_progress,
+            pass_log=pass_log, cancellable=cancellable,
         )
         if not started and not quiet:
             self.report("Another stage is still running.")
@@ -432,5 +434,10 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+            # Stop what can be stopped, then let the thread return: a QThread
+            # destroyed while still running aborts the whole process.
+            self.runner.request_stop()
+            self.report("Stopping…")
+            self.runner.wait()
         self._save_settings()
         event.accept()

@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import theme as T
-from ..config import Material, Range
+from ..config import SAMPLERS, Material, Range
 from ..pipeline import dataset_summary, run_phast_export, run_phast_import, run_sampling
 from ..predict import ModelBundle, format_quantity
 from ..quantities import describe
@@ -203,7 +203,7 @@ class ProjectPage(Page):
         self.design_form = Form()
         self.vessels = integer_field(1, 1_000_000, 500)
         self.leaks = integer_field(1, 100, 6)
-        self.sampler = choice_field(["lhs", "sobol", "random"], "lhs")
+        self.sampler = choice_field(list(SAMPLERS), "lhs")
         self.seed = integer_field(0, 10**6, 42)
         self.inventory = decimal_field(1.0, 1e9, 50_000.0, 1)
         self.design_form.add("n_vessels", self.vessels)
@@ -825,6 +825,10 @@ class TrainPage(Page):
         self.notes = Advisories()
         self.body.addWidget(self.notes)
 
+        self.cancel_button = self.actions.add_secondary(
+            "Cancel", self._cancel, "Stop training after the current batch. No run is saved."
+        )
+        self.cancel_button.setEnabled(False)
         self.train_button = self.actions.add_primary(
             "Train model", self._train, "Train on the project dataset and save a new run."
         )
@@ -894,12 +898,21 @@ class TrainPage(Page):
         self.notes.show_notes([])
         self.actions.show_progress(0, config.epochs, "epochs")
         self.window.begin_task("Training")
-        self.window.run_task(
-            lambda log, progress: train_model(project, config=config, log=log, progress=progress),
+        if self.window.run_task(
+            lambda log, progress, should_stop: train_model(
+                project, config=config, log=log, progress=progress, should_stop=should_stop
+            ),
             on_done=self._done,
             on_error=self._failed,
             on_progress=self._progress,
-        )
+            cancellable=True,
+        ):
+            self.cancel_button.setEnabled(True)
+
+    def _cancel(self) -> None:
+        if self.window.runner.request_stop():
+            self.cancel_button.setEnabled(False)
+            self.window.report("Stopping after the current batch…")
 
     def _progress(self, done: int, total: int) -> None:
         # Every step is an epoch that actually finished; early stopping can end
@@ -908,6 +921,7 @@ class TrainPage(Page):
 
     def _done(self, result) -> None:
         self.train_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
         self.actions.clear_progress()
         self._show_metrics(result.metrics)
         self._show_parity(result.run_dir)
@@ -920,6 +934,12 @@ class TrainPage(Page):
         )
 
     def _failed(self, message: str) -> None:
+        self.cancel_button.setEnabled(False)
+        if message.startswith("TrainingCancelled"):
+            self.actions.clear_progress()
+            self.train_button.setEnabled(True)
+            self.window.set_busy(False, "Training cancelled; no run saved")
+            return
         self.fail("Training failed", message, self.train_button)
 
     # -- results ----------------------------------------------------------
@@ -1089,11 +1109,15 @@ class PredictPage(Page):
     def _model_loaded(self, bundle: ModelBundle) -> None:
         self.bundle = bundle
         self._set_model_metrics(bundle)
-        self.model_notes.show_notes([])
+        note = bundle.validity_note()
+        self.model_notes.show_notes([("subtle", note)] if note else [])
         self.predict_button.setEnabled(True)
+        # A one-hot model knows only its own materials; a descriptor model
+        # also answers for catalogue materials it has descriptors for.
+        catalogue = [m.name for m in self.project.config.sampling.materials]
         self._set_materials(
             bundle.spec.material_categories
-            or [m.name for m in self.project.config.sampling.materials]
+            or list(dict.fromkeys([*bundle.spec.material_properties, *catalogue]))
         )
         self.window.finish_task(f"Loaded {bundle.run_id}")
 
@@ -1134,12 +1158,21 @@ class PredictPage(Page):
         material = self.material.currentText().strip()
         if material:
             row["material"] = material
-            properties = {
-                m.name: m.properties for m in self.project.config.sampling.materials
-            }.get(material, {})
-            for key, value in properties.items():
-                row[f"mat_{key}"] = value
+            # A material the model was trained on is looked up in the run's
+            # own table, so later catalogue edits cannot change its answer.
+            # Only a material new to the model borrows the catalogue's values.
+            known = self.bundle is not None and material in self.bundle.spec.material_properties
+            if not known:
+                properties = {
+                    m.name: m.properties for m in self.project.config.sampling.materials
+                }.get(material, {})
+                for key, value in properties.items():
+                    row[f"mat_{key}"] = value
         return row
+
+    def _set_predicting(self, running: bool) -> None:
+        self.predict_button.setEnabled(not running and self.bundle is not None)
+        self.batch_button.setEnabled(not running)
 
     def _predict(self) -> None:
         if self.bundle is None:
@@ -1149,14 +1182,23 @@ class PredictPage(Page):
             )
             return
         self.report_problem("")
-        try:
-            prediction = self.bundle.predict_one(
-                self._inputs(), mc_samples=self.mc_samples.value()
-            )
-        except Exception as exc:
-            self.fail("Prediction failed", str(exc))
-            return
+        bundle, inputs, mc = self.bundle, self._inputs(), self.mc_samples.value()
+        # Off the UI thread: with MC-dropout a prediction is no longer instant.
+        if self.window.run_task(
+            lambda: bundle.predict_one(inputs, mc_samples=mc),
+            on_done=self._show_prediction,
+            on_error=lambda message: self._predict_failed("Prediction failed", message),
+            pass_log=False,
+        ):
+            self._set_predicting(True)
+            self.window.begin_task("Predicting")
 
+    def _predict_failed(self, title: str, message: str) -> None:
+        self._set_predicting(False)
+        self.fail(title, message)
+
+    def _show_prediction(self, prediction) -> None:
+        self._set_predicting(False)
         rows = []
         for target, value in prediction.values.items():
             quantity = describe(target)
@@ -1178,7 +1220,7 @@ class PredictPage(Page):
                 for column, message in prediction.domain_warnings.items()
             ]
         )
-        self.window.report("Predicted 1 scenario")
+        self.window.finish_task("Predicted 1 scenario")
 
     def _predict_csv(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -1196,16 +1238,32 @@ class PredictPage(Page):
         if not chosen:
             return
         path = Path(chosen)
-        try:
-            frame = pd.read_csv(path)
-            predictions = self.bundle.predict_frame(frame, mc_samples=self.mc_samples.value())
+        bundle, mc = self.bundle, self.mc_samples.value()
+
+        def task():
+            result = bundle.predict_batch(pd.read_csv(path), mc_samples=mc)
             target = path.with_name(path.stem + "_predictions.csv")
-            pd.concat([frame, predictions], axis=1).to_csv(target, index=False)
-        except Exception as exc:
-            self.fail("Batch prediction failed", str(exc))
-            return
-        self.log(f"predicted {len(frame)} rows -> {target}")
-        self.domain_notes.show_notes(
-            [("subtle", f"{len(frame):,} rows written to {elide_middle(str(target), 60)}")]
-        )
-        self.window.report(f"Predicted {len(frame):,} rows")
+            result.to_csv(target, index=False)
+            return len(result), target, int((result["domain_warnings"] != "").sum())
+
+        if self.window.run_task(
+            task,
+            on_done=self._csv_done,
+            on_error=lambda message: self._predict_failed("Batch prediction failed", message),
+            pass_log=False,
+        ):
+            self._set_predicting(True)
+            self.window.begin_task(f"Predicting {path.name}")
+
+    def _csv_done(self, outcome) -> None:
+        self._set_predicting(False)
+        rows, target, flagged = outcome
+        self.log(f"predicted {rows} rows -> {target}")
+        notes = [("subtle", f"{rows:,} rows written to {elide_middle(str(target), 60)}")]
+        if flagged:
+            notes.append(
+                ("warning", f"{flagged:,} rows lie outside the training envelope; "
+                 "see the domain_warnings column.")
+            )
+        self.domain_notes.show_notes(notes)
+        self.window.finish_task(f"Predicted {rows:,} rows")

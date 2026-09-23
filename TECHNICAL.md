@@ -12,8 +12,15 @@ Latin Hypercube (or Sobol) sampling over temperature, pressure and orifice diame
   ones — linear spacing puts 90 % of samples in the top decade and starves the small releases;
 * **per-material envelopes**, so cryogenic and ambient fluids are each sampled where they are
   physically meaningful;
+* **one design per material**, so each material's vessels are stratified across its own envelope
+  (one design dealt out across all materials would leave each a random subset of it);
 * **stratified hole sizes per vessel**, so every vessel spans the full size range;
-* a fixed seed — the same config always produces the same design.
+* a fixed seed — the same config always produces the same design;
+* **a design ID in every vessel name** (`D33C26_PV00001`), a hash of the sampling config. Results
+  from two designs can be appended to one dataset without one scenario replacing another, and the
+  grouped split never merges two different vessels that happen to share a number.
+
+Samplers: `lhs` (default), `sobol`, `halton`, and `random` (plain uniform, the baseline).
 
 Materials carry optional property descriptors (molecular weight, boiling point, critical point).
 These become model inputs, which is what lets a single network cover several materials rather
@@ -48,7 +55,8 @@ property descriptors.
 
 ## Writing the Phast input workbook
 
-Cases are written into a copy of `templates/Safeti Template Input Sheet.xlsx` — a pre-configured
+Cases are written into a copy of `templates/Safeti Template Input Sheet.xlsx` (a client workbook,
+not in the repository — see the README) — a pre-configured
 empty study carrying the weather set, parameter sets and terrain. Columns are addressed by
 **Safeti attribute code**, read from the sheet's own header block rather than by position, and
 values are converted into whatever unit the template declares, so a template configured in psi or
@@ -85,7 +93,7 @@ sheets are joined on `path + scenario + weather`. Weather categories (`Category 
 sampled cases so the true inputs — including material — travel with each target. Scenarios that
 failed to converge in Phast are dropped and reported, not silently turned into zeros.
 
-Two things make the join survive real projects:
+Three things make the join survive real projects:
 
 * **Identity is matched, not assumed.** Where equipment sits in the study decides how Phast
   reports it: a flat study puts the leak name in the `Scenario` column and stops the path at the
@@ -93,6 +101,10 @@ Two things make the join survive real projects:
   `Scenario`. Every candidate name is tried — the scenario label and each path segment — and a row
   that only identifies its vessel still inherits that vessel's material, conditions and grouping
   key. The report says how many rows matched by leak and how many by vessel.
+* **Rows no case covers still get a grouping key.** Without a case table, or for results the
+  table does not cover, the grouping key is the vessel state Phast echoes — material, temperature
+  and pressure — which is exactly what the grouped split must keep on one side. Material
+  descriptors are filled from the project's material catalogue.
 * **Threshold columns are matched by level, not by value.** `Distance downwind to intensity level
   1 (4 kW/m2) (m)` and the same column at 6.3 kW/m² are the same quantity at a different study
   setting, so targets are named `Jet_fire_distance_level1`…`level3` and the threshold actually
@@ -106,6 +118,15 @@ Roughly 20 quantities are extracted per scenario; the four trained by default ar
 A multi-output MLP — shared trunk, per-target heads, LayerNorm and swish — trained on
 log-transformed targets, with:
 
+* **`log10(y + c)` targets.** `log1p` is linear below about 0.1, so it cannot tell a 0.001 kg/s
+  release from a 0.01 kg/s one; a plain log gives every decade the same weight. The offset `c`
+  (`training.log_offsets`, in the target's own unit) is the smallest value worth resolving and
+  keeps zeros finite. On a synthetic choked-flow set this cut the median error below 0.01 kg/s
+  from 100 % to 18 %.
+* **R² in log space** for log targets. On raw values a few large releases dominate the sum of
+  squares, and a model that gets small releases badly wrong still scores about 0.9. The raw-value
+  R² is kept as `r2_linear`.
+
 * **grouped splitting by vessel.** Leaks from one vessel share temperature, pressure and material;
   splitting them at random puts near-copies in both train and test and inflates the score.
   Splitting by vessel measures generalisation to *new equipment*, which is what the model is for.
@@ -117,16 +138,26 @@ log-transformed targets, with:
   and masked out of that target's loss where it does not, so a dataset with 100 % release rates
   and 43 % LFL distances trains on all of it instead of only the complete rows. Coverage and
   per-target test counts are reported.
+* **fixed settings recorded.** Inputs the design held constant (elevation, inventory) and the
+  template's per-row defaults are saved with the run; a varied elevation or inventory becomes a
+  feature instead. The model says nothing about any other value of a fixed setting, and
+  prediction says so.
 * **per-run artifacts.** Each run writes its own directory holding the model, scalers, feature
-  spec, `metrics.json`, training history and test predictions. Runs never overwrite each other;
+  spec, the descriptors of every training material, `metrics.json`, training history and test
+  predictions. Runs never overwrite each other;
   `models/registry.json` records which one is current.
 
 ## Prediction
 
-Single-point or batch (`--csv`) prediction, reported in real units. `--mc 50` runs MC-dropout
-passes to attach an uncertainty to each answer. Inputs outside the training envelope are flagged
-as extrapolation rather than answered silently — the model will still produce a number, and it is
-the flag that tells you what it is worth.
+Single-point or batch (`--csv`) prediction, reported in real units. A material is looked up in
+the run's own descriptor table, so later catalogue edits cannot change an old model's answer; an
+unknown material without descriptors is refused. `--mc 50` runs MC-dropout passes, batched into
+one call, to attach an uncertainty to each answer.
+
+Inputs outside the training envelope are flagged as extrapolation rather than answered silently:
+against the global range, against the range trained *for that material*, and for any fixed
+setting given a different value. The model will still produce a number, and it is the flag that
+tells you what it is worth. Batch predictions carry the flags in a `domain_warnings` column.
 
 ## Tests
 
@@ -134,7 +165,8 @@ the flag that tells you what it is worth.
 uv run --with pytest python -m pytest tests -q
 ```
 
-Covers sampling reproducibility and bounds, unit conversion, template schema discovery, workbook
-write and round-trip, result extraction against a real Safeti output workbook, feature-spec
-round-tripping (training and inference must agree exactly), the grouped split, and the interface
-rules the application is built on.
+Covers the functions whose failure gives a wrong answer without an error: sampling envelopes and
+stratification, unit conversion, workbook write and round-trip (needs the template), the result
+join across study layouts, feature agreement between training and inference, material lookup and
+domain checks, the grouped split, an end-to-end train and predict, and the GUI's task threading
+and cancellation.

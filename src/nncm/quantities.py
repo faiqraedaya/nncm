@@ -45,7 +45,8 @@ _SAMPLING = {
     "sampler": Quantity(
         "Sampler", "",
         "Latin hypercube spreads points evenly over the ranges; Sobol keeps "
-        "filling the gaps as the count grows; random is the honest baseline.",
+        "filling the gaps as the count grows; Halton is a cheaper low-discrepancy "
+        "sequence; random is plain uniform sampling, the honest baseline.",
     ),
     "seed": Quantity(
         "Seed", "",
@@ -249,8 +250,14 @@ _TARGETS = {
 _METRICS = {
     "r2": Quantity(
         "R2", "",
-        "Share of the variance the model reproduces on held-out vessels. "
-        "1.0 is perfect; 0.0 is no better than always predicting the mean.",
+        "Share of the variance the model reproduces on held-out vessels, "
+        "computed on log10 values for log-transformed targets so small releases "
+        "count as much as large ones. 1.0 is perfect; 0.0 is no better than "
+        "always predicting the mean.",
+    ),
+    "r2_linear": Quantity(
+        "R2 (linear)", "",
+        "R2 on the raw values. Dominated by the largest releases.",
     ),
     "mae": Quantity("MAE", "", "Mean absolute error, in the unit of the target."),
     "rmse": Quantity("RMSE", "", "Root mean squared error, in the unit of the target. Large errors count for more."),
@@ -261,7 +268,7 @@ _METRICS = {
     ),
     "log10_rmse": Quantity("log10 RMSE", "decades", "Error in log space — a factor rather than a difference."),
     "n_test": Quantity("Test rows", "rows", "Held-out rows the score was computed on."),
-    "mean_r2": Quantity("Mean R2", "", "R2 averaged over every scored target."),
+    "mean_r2": Quantity("Mean R2", "", "R2 averaged over every scored target, in log space for log targets."),
 }
 
 # ---------------------------------------------------------------------------
