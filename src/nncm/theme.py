@@ -154,7 +154,29 @@ matplotlib figures — so a chart drawn in the window is set in the same
 typeface as the words beside it."""
 
 FONT_FAMILY = "Inter"
-FONT_STACK = (FONT_FAMILY, "Segoe UI Variable Text", "Segoe UI", "sans-serif")
+FONT_VARIABLE_FAMILY = "Inter Variable"
+"""What Qt calls ``InterVariable.ttf``. A variable font registers under its own
+family name, not as extra styles of the static one, so it has to be asked for
+by this name or Qt hands back the static faces."""
+
+_FALLBACKS = ("Segoe UI Variable Text", "Segoe UI", "sans-serif")
+
+FONT_STACK = (FONT_VARIABLE_FAMILY, FONT_FAMILY) + _FALLBACKS
+"""For Qt. The variable face first: its named instances cover the whole weight
+axis from one file, and — the reason it is here — Qt applies its kerning at
+sub-pixel positions, which the static faces only match once hinting is relaxed
+(see ``FONT_HINTING`` in :mod:`nncm.gui.theme`). The static family stays behind
+it so a missing variable file costs nothing."""
+
+MPL_FONT_STACK = (FONT_FAMILY,) + _FALLBACKS
+"""For matplotlib, which must have the static faces.
+
+matplotlib has no variable-axis support: it reads a variable font's default
+instance and nothing else, so every weight it registers from ``InterVariable``
+comes back as 400 and the italic file is indistinguishable from the upright.
+Asking it for the static family is what keeps a bold axis title bold. Same
+typeface either way, so the figure still matches the window."""
+
 FONT_MONO_STACK = ("Cascadia Mono", "Consolas", "SF Mono", "monospace")
 
 # Sizes in px. Qt scales px with DPI; pt diverges across platforms.
@@ -300,7 +322,7 @@ def matplotlib_rc() -> dict[str, Any]:
         "legend.fontsize": pt(FONT_CAPTION),
         "legend.labelcolor": ink_hex(INK_SECONDARY),
         "font.family": "sans-serif",
-        "font.sans-serif": list(FONT_STACK),
+        "font.sans-serif": list(MPL_FONT_STACK),
         "font.size": pt(FONT_CAPTION),
         "text.color": ink_hex(INK_PRIMARY),
         "figure.titlesize": pt(FONT_HEADING),

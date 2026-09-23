@@ -32,6 +32,20 @@ logger = logging.getLogger(__name__)
 
 FONTS_DIR = T.FONTS_DIR  # one place says where the type lives
 
+FONT_HINTING = QFont.PreferVerticalHinting
+"""Hint the stems, not the spacing.
+
+Under Qt's default preference the shaper rounds every glyph advance to a whole
+pixel, which quantises the kerning away: at 22 px the string "Project" measures
+the same width with kerning switched on as with it switched off. The result is
+the uneven word colour this setting exists to remove — pairs that should tuck
+together do not, and the slack lands in whichever gap the rounding favoured.
+
+Vertical hinting keeps the advances sub-pixel, so kerning survives, while still
+snapping horizontal stems to the pixel grid — crisper on screen than
+``PreferNoHinting`` at the same spacing.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Type
@@ -39,18 +53,26 @@ FONTS_DIR = T.FONTS_DIR  # one place says where the type lives
 def load_fonts() -> bool:
     """Register the bundled Inter faces with Qt.
 
-    Returns True if the family is available afterwards. A missing face is
-    logged rather than raised — the app still runs on the platform sans-serif,
-    it just does not look like itself.
+    Returns True if either the variable or the static family is available
+    afterwards. A missing face is logged rather than raised — the app still
+    runs on the platform sans-serif, it just does not look like itself.
     """
-    if not FONTS_DIR.is_dir():
+    if FONTS_DIR.is_dir():
+        for path in sorted(FONTS_DIR.iterdir()):
+            if path.suffix.lower() in {".ttf", ".otf"}:
+                if QFontDatabase.addApplicationFont(str(path)) == -1:
+                    logger.warning("Qt refused the bundled font file: %s", path.name)
+    else:
         logger.warning("Bundled font directory missing: %s", FONTS_DIR)
-        return T.FONT_FAMILY in QFontDatabase.families()
-    for path in sorted(FONTS_DIR.iterdir()):
-        if path.suffix.lower() in {".ttf", ".otf"}:
-            if QFontDatabase.addApplicationFont(str(path)) == -1:
-                logger.warning("Qt refused the bundled font file: %s", path.name)
-    return T.FONT_FAMILY in QFontDatabase.families()
+
+    families = QFontDatabase.families()
+    if T.FONT_VARIABLE_FAMILY not in families:
+        # Not fatal — the stack falls through to the static faces, which look
+        # the same and merely spend four files doing it.
+        logger.info("%s not registered; using the static faces.",
+                    T.FONT_VARIABLE_FAMILY)
+    return any(name in families
+               for name in (T.FONT_VARIABLE_FAMILY, T.FONT_FAMILY))
 
 
 def font(
@@ -67,6 +89,7 @@ def font(
     value.setPixelSize(size)
     value.setWeight(QFont.Weight(weight))  # PySide6 rejects a bare int here
     value.setItalic(italic)
+    value.setHintingPreference(FONT_HINTING)
     if figures:
         tabular(value)
     return value

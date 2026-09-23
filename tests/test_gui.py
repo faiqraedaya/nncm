@@ -425,6 +425,61 @@ def test_bundled_faces_register_and_are_the_ones_used(app):
         assert info.italic() == italic
 
 
+def test_kerning_is_not_rounded_away(app):
+    """The bug this guards: Qt's default hinting rounds every glyph advance to
+    a whole pixel, which quantises the kerning out of existence — "Project" at
+    title size measures identically with kerning on and off, and the word ends
+    up unevenly spaced. The theme asks for vertical-only hinting so advances
+    stay sub-pixel."""
+    from PySide6.QtGui import QFont, QFontMetricsF
+
+    from nncm.gui.theme import FONT_HINTING
+
+    assert FONT_HINTING != QFont.PreferDefaultHinting
+
+    for size, weight in ((theme.FONT_TITLE, theme.WEIGHT_SEMIBOLD),
+                         (theme.FONT_LABEL, theme.WEIGHT_MEDIUM)):
+        kerned = gui_theme.font(size, weight)
+        flat = gui_theme.font(size, weight)
+        flat.setKerning(False)
+        assert (QFontMetricsF(kerned).horizontalAdvance("Project")
+                != QFontMetricsF(flat).horizontalAdvance("Project")), (
+            f"kerning made no difference at {size}px/{weight}: the advances "
+            "are being rounded to whole pixels"
+        )
+
+
+def test_matplotlib_gets_one_file_per_weight():
+    """The bug this guards: matplotlib has no variable-axis support. Point it
+    at the variable family and every weight resolves to the same file at 400,
+    so bold chart text silently stops being bold. Its stack therefore names the
+    static family — the same typeface, four files."""
+    import matplotlib
+    from matplotlib import font_manager
+
+    from nncm.gui.theme import FONTS_DIR
+
+    if not any(FONTS_DIR.glob("*.ttf")):
+        pytest.skip("no faces bundled")
+
+    theme.apply_matplotlib_style()
+    # Read what was actually pushed onto matplotlib, not the token beside it.
+    stack = list(matplotlib.rcParams["font.sans-serif"])
+    assert theme.FONT_VARIABLE_FAMILY not in stack
+
+    def resolve(**kwargs):
+        return pathlib.Path(font_manager.findfont(
+            font_manager.FontProperties(family=stack, **kwargs))).name
+
+    faces = {
+        resolve(weight=theme.WEIGHT_REGULAR),
+        resolve(weight=theme.WEIGHT_MEDIUM),
+        resolve(weight=theme.WEIGHT_SEMIBOLD),
+        resolve(style="italic"),
+    }
+    assert len(faces) == 4, f"weights collapsed onto one file: {sorted(faces)}"
+
+
 def test_charts_are_set_in_the_same_face_as_the_window():
     """One typeface, one voice — chrome and figures alike.
 
