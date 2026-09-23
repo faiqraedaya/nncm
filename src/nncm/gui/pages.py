@@ -45,7 +45,6 @@ from .widgets import (
     Advisories,
     Card,
     DataTable,
-    Explanation,
     Form,
     MetricCell,
     PathField,
@@ -86,10 +85,9 @@ class Page(QWidget):
     separately-placed titles drift; one placement cannot.
 
     The body scrolls when the window is shorter than the stage needs. Without
-    it Qt buys the missing height by compressing whatever will compress, and
-    what compresses first is the explanation at the foot of a card — so a short
-    window would silently cut a sentence in half rather than admit it ran out
-    of room. The status line and the action bar stay put: the stage's one
+    it Qt buys the missing height by compressing whatever will compress, so a
+    short window would silently squash a card rather than admit it ran out of
+    room. The status line and the action bar stay put: the stage's one
     primary is never something you have to scroll to find, and neither is the
     message saying why it did not work.
     """
@@ -232,19 +230,16 @@ class ProjectPage(Page):
         top.addWidget(ranges, 1)
         settings_content = QWidget()
         settings_content.setLayout(top)
-        # The settings scroll inside their own pane. With the explanations
-        # shown they are taller than half the window, and the alternative is
-        # for them to push the materials table off the foot of the page.
+        # The settings scroll inside their own pane rather than push the
+        # materials table off the foot of the page in a short window.
         settings = scroll_pane(settings_content)
         settings.setMinimumHeight(220)
 
-        materials = Card("Materials")
-        materials.add(
-            Explanation(
-                "Every vessel draws one material. A material with no components "
-                "is a pure component; per-material ranges override the design "
-                "ranges above. Double-click a row, or use Edit, to change one."
-            )
+        materials = Card(
+            "Materials",
+            tip="Every vessel draws one material. A material with no components "
+            "is a pure component; per-material ranges override the design "
+            "ranges above. Double-click a row, or use Edit, to change one.",
         )
         toolbar = ly.hbox(spacing=T.SPACING_ROW)
         add_button = ly.button("Add material", on_click=self._add_material,
@@ -291,14 +286,14 @@ class ProjectPage(Page):
         self.materials_table.setMinimumHeight(T.ROW_HEIGHT * 5 + 44)
         self.materials_table.cellDoubleClicked.connect(lambda row, _column: self._edit_material(row))
         materials.add(self.materials_table, 1)
-        # A splitter rather than a plain stack: the settings above are tall
-        # enough with their explanations shown to push the table off the foot
-        # of the page, and a materials list showing none of its materials is
-        # the landing page failing at the one thing it is for. The user can
-        # rebalance the two, and the table keeps a share by default.
+        # A splitter rather than a plain stack: in a short window the settings
+        # above can push the table off the foot of the page, and a materials
+        # list showing none of its materials is the landing page failing at the
+        # one thing it is for. The settings get roughly their natural height;
+        # the table takes the rest, and the user can rebalance the two.
         self.body.addWidget(
             ly.splitter(settings, materials, orientation=Qt.Vertical,
-                        sizes=[440, 360]),
+                        sizes=[340, 460]),
             1,
         )
 
@@ -594,13 +589,11 @@ class PhastPage(Page):
         super().__init__(window)
         top = ly.hbox(spacing=T.SPACING_GROUP)
 
-        export = Card("1 · Write the input workbook")
-        export.add(
-            Explanation(
-                "Writes the sampled cases into a copy of the Safeti template. "
-                "Import the file into Phast, run the study, then export its "
-                "results and come back to step 2."
-            )
+        export = Card(
+            "1 · Write the input workbook",
+            tip="Writes the sampled cases into a copy of the Safeti template. "
+            "Import the file into Phast, run the study, then export its "
+            "results and come back to step 2.",
         )
         self.export_form = Form()
         self.export_path = PathField("Save Phast input workbook", mode="save")
@@ -614,12 +607,10 @@ class PhastPage(Page):
         export.body().addStretch(1)
         top.addWidget(export, 1)
 
-        extract = Card("2 · Read the result workbook")
-        extract.add(
-            Explanation(
-                "Joins the Discharge, Dispersion and Fire sheets back onto the "
-                "sampled cases and writes the training dataset."
-            )
+        extract = Card(
+            "2 · Read the result workbook",
+            tip="Joins the Discharge, Dispersion and Fire sheets back onto the "
+            "sampled cases and writes the training dataset.",
         )
         self.import_form = Form()
         self.import_path = PathField("Select Phast result workbook")
@@ -780,12 +771,10 @@ class TrainPage(Page):
 
     def __init__(self, window):
         super().__init__(window)
-        settings = Card("Hyperparameters")
-        settings.add(
-            Explanation(
-                "Training splits by vessel, so rows that share a vessel never "
-                "land on both sides of the split and the scores stay honest."
-            )
+        settings = Card(
+            "Hyperparameters",
+            tip="Training splits by vessel, so rows that share a vessel never "
+            "land on both sides of the split and the scores stay honest.",
         )
         columns = ly.hbox(spacing=T.SPACING_SECTION)
         left, right = Form(), Form()
@@ -809,8 +798,9 @@ class TrainPage(Page):
         right.add("targets", self.targets, span=True)
         right.add_switch("use_weather", self.use_weather)
         right.add_switch("use_material_properties", self.use_properties)
-        columns.addWidget(left, 1)
-        columns.addWidget(right, 1)
+        # Both forms start at the top, so their first rows share a baseline.
+        columns.addWidget(left, 1, Qt.AlignTop)
+        columns.addWidget(right, 1, Qt.AlignTop)
         settings.add_layout(columns)
         self.body.addWidget(settings)
 

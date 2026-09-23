@@ -117,6 +117,7 @@ def stylesheet() -> str:
     """
     ink = T.ink
     family = ", ".join(f'"{name}"' for name in T.FONT_STACK[:-1]) + ", sans-serif"
+    display = ", ".join(f'"{name}"' for name in T.FONT_DISPLAY_STACK[:-1]) + ", serif"
     grab = (T.SPLITTER_GRAB - T.SPLITTER_VISUAL) // 2
 
     return f"""
@@ -135,10 +136,10 @@ QScrollArea > QWidget > QWidget {{ background: transparent; }}
 /* -- Type -------------------------------------------------------------- */
 QLabel {{ background: transparent; border: none; padding: 0px; }}
 QLabel[role="title"] {{
-    font-size: {T.FONT_TITLE}px; font-weight: {T.WEIGHT_SEMIBOLD};
+    font-family: {display}; font-size: {T.FONT_TITLE}px; font-weight: {T.WEIGHT_DISPLAY};
 }}
 QLabel[role="heading"], QLabel[role="brand"] {{
-    font-size: {T.FONT_HEADING}px; font-weight: {T.WEIGHT_SEMIBOLD};
+    font-family: {display}; font-size: {T.FONT_HEADING}px; font-weight: {T.WEIGHT_DISPLAY};
 }}
 QLabel[role="caption"] {{
     font-size: {T.FONT_CAPTION}px; font-weight: {T.WEIGHT_MEDIUM};
@@ -146,10 +147,6 @@ QLabel[role="caption"] {{
 }}
 QLabel[role="unit"] {{
     font-size: {T.FONT_CAPTION}px; font-weight: {T.WEIGHT_MEDIUM};
-    color: {ink(T.INK_TERTIARY)};
-}}
-QLabel[role="explanation"] {{
-    font-size: {T.FONT_CAPTION}px; font-style: italic;
     color: {ink(T.INK_TERTIARY)};
 }}
 QLabel[role="empty"] {{

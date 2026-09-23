@@ -9,9 +9,8 @@ The menu bar offers every action the window has, so the whole application is
 reachable from the keyboard. Each stage repeats its own action as the single
 primary in its action bar; nothing else carries a button.
 
-Three things the window owns on behalf of every page: whether explanations are
-shown (they roughly double the height of a form, so they are a toggle),
-whether detail columns are shown (a table should hold the columns a decision is
+Two things the window owns on behalf of every page: whether detail columns are
+shown (a table should hold the columns a decision is
 made on, and nothing else), and the busy state — the status bar's progress
 indicator exists only while something is running.
 """
@@ -41,7 +40,7 @@ from . import theme as gui_theme
 from .icons import icon
 from .pages import Page, PhastPage, PredictPage, ProjectPage, SamplePage, TrainPage
 from .sidebar import Sidebar
-from .widgets import Explanation, LogView
+from .widgets import LogView
 from .workers import TaskRunner
 
 
@@ -75,7 +74,6 @@ class MainWindow(QMainWindow):
         self.project = Project.create(Path(project_root or default_project_root()))
         self.runner = TaskRunner(self)
         self.settings = QSettings("nncm", "nncm")
-        self.descriptions_visible = True
         self.detail_visible = False
         self._task_name = ""
         self._sidebar_width = Sidebar.DEFAULT_W
@@ -218,14 +216,6 @@ class MainWindow(QMainWindow):
         view.addAction(self.sidebar_action)
         view.addSeparator()
 
-        self.descriptions_action = QAction("Show descriptions", self, checkable=True)
-        self.descriptions_action.setChecked(True)
-        self.descriptions_action.setStatusTip(
-            "Show the sentence under each setting. They roughly double the height of a form."
-        )
-        self.descriptions_action.toggled.connect(self.set_descriptions_visible)
-        view.addAction(self.descriptions_action)
-
         self.detail_action = QAction("Show detail columns", self, checkable=True)
         self.detail_action.setStatusTip(
             "Show every column, not only the ones a decision is made on."
@@ -338,11 +328,6 @@ class MainWindow(QMainWindow):
         self.phast_page.refresh_state()
 
     # -- view toggles ------------------------------------------------------
-    def set_descriptions_visible(self, visible: bool) -> None:
-        self.descriptions_visible = visible
-        for label in self.stack.findChildren(Explanation):
-            label.setVisible(visible)
-
     def set_detail_visible(self, visible: bool) -> None:
         self.detail_visible = visible
         for page in self._pages():
@@ -388,7 +373,6 @@ class MainWindow(QMainWindow):
         self.log(f"project: {self.project.root}")
         for page in self._pages():
             page.on_project_changed()
-        self.set_descriptions_visible(self.descriptions_visible)
         self.set_detail_visible(self.detail_visible)
         self.refresh_project_state()
 
@@ -412,7 +396,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About NNCM",
-            f"<p style='font-size:{T.FONT_HEADING}px; font-weight:600;'>NNCM</p>"
+            f"<p style='font-family:\"{T.FONT_DISPLAY_FAMILY}\"; font-size:{T.FONT_HEADING}px; "
+            f"font-weight:{T.WEIGHT_DISPLAY};'>NNCM</p>"
             "<p>Neural network consequence modelling. Samples release scenarios, "
             "drives them through Phast or Safeti, and trains a surrogate model "
             "that predicts consequence results in milliseconds rather than "
