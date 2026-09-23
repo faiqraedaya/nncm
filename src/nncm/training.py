@@ -566,7 +566,7 @@ def plot_parity(run_dir: Path, out_path: Path | None = None):
             f"{dropped:,} points are not drawn: a log axis has no place for a "
             "missing or non-positive value."
         )
-    top = theme.figure_header(fig, "Predicted against Phast", caveats)
+    top = theme.figure_header(fig, "Predicted against Phast", caveats, inline=out_path is not None)
     fig.subplots_adjust(top=top, left=0.085, right=0.98, bottom=0.11, hspace=0.55, wspace=0.26)
 
     if out_path is not None:

@@ -510,6 +510,8 @@ class PlotArea(QFrame):
         # The figure's own facecolor is the canvas token, so the widget needs
         # no style sheet of its own to sit on the same ground.
         self._canvas = FigureCanvasQTAgg(figure)
+        # What the chart capped or excluded is its hover tip, not printed text.
+        self._canvas.setToolTip("\n".join(getattr(figure, "nncm_caveats", [])))
         self._layout.addWidget(self._canvas)
         self._canvas.draw_idle()
 

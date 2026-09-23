@@ -437,11 +437,14 @@ def rounded_barh(ax, y, width, height, color, radius=4.0):
     return patch
 
 
-def figure_header(fig, title: str, caveats: "str | list[str]") -> float:
+def figure_header(fig, title: str, caveats: "str | list[str]", *, inline: bool = True) -> float:
     """Title, then the caveats under it in the explanatory voice.
 
-    The subtitle is where a chart discloses what it capped, excluded or
-    normalised, so it is part of the chart rather than an optional extra.
+    The caveats are where a chart discloses what it capped, excluded or
+    normalised. In a saved image they are printed under the title, since a
+    file has no hover. In the window (``inline=False``) they are kept off the
+    figure and stored as ``fig.nncm_caveats``, which the plot area shows as its
+    hover tip, so the chart stays quiet until asked.
     Returns the figure fraction the axes may start at — with room left for the
     first row's own titles, which sit above the axes box.
 
@@ -451,6 +454,9 @@ def figure_header(fig, title: str, caveats: "str | list[str]") -> float:
     """
     if isinstance(caveats, str):
         caveats = [caveats]
+    fig.nncm_caveats = list(caveats)
+    if not inline:
+        caveats = []
     width_in, height_in = fig.get_size_inches()
     height = height_in * fig.dpi
     title_px, caption_px = FONT_HEADING, FONT_CAPTION

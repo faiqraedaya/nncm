@@ -287,7 +287,7 @@ def plot_case_distributions(cases: pd.DataFrame, out_path: Path | None = None):
 
     # Lay the figure out before anything is drawn into it, so a mark sized in
     # screen units is sized against the axes it will actually occupy.
-    top = theme.figure_header(fig, "Case design coverage", caveats)
+    top = theme.figure_header(fig, "Case design coverage", caveats, inline=out_path is not None)
     fig.subplots_adjust(top=top, left=0.07, right=0.965, bottom=0.10)
 
     # -- vessel conditions -------------------------------------------------
